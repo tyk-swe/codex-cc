@@ -1,6 +1,6 @@
 # Codex Prompt Anti-Patterns
 
-Avoid these when prompting Codex or GPT-5.4.
+Avoid these when prompting Codex.
 
 ## Vague task framing
 
@@ -15,6 +15,22 @@ Better:
 ```xml
 <task>
 Review this change for material correctness and regression risks.
+</task>
+```
+
+## Missing end state
+
+Bad:
+
+```text
+Debug this failure.
+```
+
+Better:
+
+```xml
+<task>
+Find why `npm test` fails in packages/api and apply the smallest fix.
 </task>
 ```
 
@@ -37,20 +53,22 @@ Return:
 </structured_output_contract>
 ```
 
-## No follow-through default
+## Over-steering a capable model
+
+Current Codex models plan, read the code they need, and check their own work. Scripting every step, or piling on "verify everything twice", leads to redundant test runs and slower, noisier turns.
 
 Bad:
 
 ```text
-Debug this failure.
+Before doing anything, read every file in src/, run the full test suite, fix the bug, run the full test suite again, then double-check every change.
 ```
 
 Better:
 
 ```xml
-<default_follow_through_policy>
-Keep going until you have enough evidence to identify the root cause confidently.
-</default_follow_through_policy>
+<task>
+Fix the crash in src/cache.ts when the cache is empty. Keep the public API unchanged.
+</task>
 ```
 
 ## Asking for more reasoning instead of a better contract
@@ -61,13 +79,7 @@ Bad:
 Think harder and be very smart.
 ```
 
-Better:
-
-```xml
-<verification_loop>
-Before finalizing, verify that the answer matches the observed evidence and task requirements.
-</verification_loop>
-```
+Better: state the end state and the output you need. If the task genuinely needs more reasoning, let the user choose a higher `--effort` instead of adding prompt text.
 
 ## Mixing unrelated jobs into one run
 
