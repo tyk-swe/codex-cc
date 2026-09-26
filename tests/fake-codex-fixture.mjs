@@ -412,9 +412,41 @@ rl.on("line", (line) => {
           throw new Error("missing external session migration");
         }
         const sourcePath = fs.realpathSync(session.path);
+        const importId = "import_" + crypto.randomUUID();
+        if (BEHAVIOR === "external-import-failure") {
+          // Codex can finish (and fail) the import before answering the request.
+          send({
+            method: "externalAgentConfig/import/completed",
+            params: {
+              importId,
+              itemTypeResults: [
+                {
+                  itemType: "SESSIONS",
+                  successes: [],
+                  failures: [
+                    {
+                      itemType: "SESSIONS",
+                      errorType: null,
+                      subErrorType: null,
+                      failureStage: "session_missing",
+                      message: "external agent session was not detected for import: " + sourcePath,
+                      cwd: null,
+                      source: sourcePath
+                    }
+                  ]
+                }
+              ]
+            }
+          });
+          send({ id: message.id, result: { importId } });
+          break;
+        }
+        // Older CLIs only recorded the imported thread in a ledger file and
+        // completed without results; current CLIs report it in the completion.
+        const legacyImport = BEHAVIOR === "external-import-legacy";
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
-        const ledger = loadImportLedger();
+        const ledger = legacyImport ? loadImportLedger() : { records: state.importRecords || [] };
         let record = ledger.records.find(
           (candidate) => candidate.source_path === sourcePath && candidate.content_sha256 === contentSha256
         );
@@ -440,11 +472,36 @@ rl.on("line", (line) => {
             source_modified_at: null
           };
           ledger.records.push(record);
+          if (legacyImport) {
+            saveImportLedger(ledger);
+          } else {
+            state.importRecords = ledger.records;
+          }
           saveState(state);
-          saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        if (legacyImport) {
+          send({ id: message.id, result: {} });
+          send({ method: "externalAgentConfig/import/completed", params: {} });
+          break;
+        }
+        send({
+          method: "externalAgentConfig/import/progress",
+          params: { importId, itemTypeResults: [{ itemType: "SESSIONS", successes: [], failures: [] }] }
+        });
+        send({ id: message.id, result: { importId } });
+        send({
+          method: "externalAgentConfig/import/completed",
+          params: {
+            importId,
+            itemTypeResults: [
+              {
+                itemType: "SESSIONS",
+                successes: [{ itemType: "SESSIONS", cwd: session.cwd, source: sourcePath, target: thread.id, title: thread.name }],
+                failures: []
+              }
+            ]
+          }
+        });
         break;
       }
 

@@ -290,6 +290,8 @@ test("transfer delegates the current Claude session directly to native import", 
   assert.equal(payload.sessionId, sessionId);
 
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  // The thread id came from the import completion, not Codex's private ledger.
+  assert.equal(fs.existsSync(path.join(home, ".codex", "external_agent_session_imports.json")), false);
   assert.equal(fakeState.threads.length, 1);
   assert.equal(fakeState.threads[0].ephemeral, false);
   assert.equal(fakeState.threads[0].name, "Native transfer");
@@ -357,6 +359,44 @@ test("transfer fails visibly when native import completes without a ledger recor
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /did not record an imported thread/);
+});
+
+function setUpTransferSource(behavior) {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  const projectDir = path.join(home, ".claude", "projects", "-repo");
+  const sourcePath = path.join(projectDir, "session.jsonl");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(
+    sourcePath,
+    `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "Carry this over." } })}\n`,
+    "utf8"
+  );
+  const env = { ...buildEnv(binDir), HOME: home, CODEX_HOME: path.join(home, ".codex") };
+  return { home, repo, sourcePath, env };
+}
+
+test("transfer surfaces the reason Codex gives for a failed import", () => {
+  const { repo, sourcePath, env } = setUpTransferSource("external-import-failure");
+
+  const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], { cwd: repo, env });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Codex could not import the Claude session \(session_missing\): external agent session was not detected for import/);
+});
+
+test("transfer still reads the import ledger written by older Codex versions", () => {
+  const { home, repo, sourcePath, env } = setUpTransferSource("external-import-legacy");
+
+  const result = run("node", [SCRIPT, "transfer", "--source", sourcePath, "--json"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).threadId, "thr_1");
+  assert.equal(fs.existsSync(path.join(home, ".codex", "external_agent_session_imports.json")), true);
 });
 
 test("transfer rejects sources outside the Claude projects directory", () => {

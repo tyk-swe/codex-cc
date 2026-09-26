@@ -785,11 +785,22 @@ function externalAgentSessionMigration(sourcePath, cwd) {
   };
 }
 
+// Completions from older CLIs carry no importId (or no params at all).
+function isCompletionForImport(completion, importId) {
+  return !completion?.importId || !importId || completion.importId === importId;
+}
+
+/** Resolves with the matching `externalAgentConfig/import/completed` params. */
 async function requestExternalAgentSessionImport(client, params) {
   const previousHandler = client.notificationHandler;
   let timeout = null;
-  let resolveCompleted;
-  let rejectCompleted;
+  let importId = null;
+  let responded = false;
+  const earlyCompletions = [];
+  /** @type {(completion: any) => void} */
+  let resolveCompleted = () => {};
+  /** @type {(error: Error) => void} */
+  let rejectCompleted = () => {};
   const completed = new Promise((resolve, reject) => {
     resolveCompleted = resolve;
     rejectCompleted = reject;
@@ -798,7 +809,13 @@ async function requestExternalAgentSessionImport(client, params) {
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      const completion = message.params ?? {};
+      if (!responded) {
+        // Can arrive before the response that tells us our importId.
+        earlyCompletions.push(completion);
+      } else if (isCompletionForImport(completion, importId)) {
+        resolveCompleted(completion);
+      }
       return;
     }
     previousHandler?.(message);
@@ -808,12 +825,46 @@ async function requestExternalAgentSessionImport(client, params) {
   }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
 
   try {
-    await client.request("externalAgentConfig/import", params);
-    await completed;
+    const response = await client.request("externalAgentConfig/import", params);
+    importId = response?.importId ?? null;
+    responded = true;
+    const earlyMatch = earlyCompletions.find((completion) => isCompletionForImport(completion, importId));
+    if (earlyMatch) {
+      resolveCompleted(earlyMatch);
+    }
+    return await completed;
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+function realpathOrSelf(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+/**
+ * Picks the imported thread (success `target`) or the failure for this Claude
+ * session out of an `import/completed` payload.
+ */
+function readImportedSessionResult(completion, sourcePath) {
+  const results = Array.isArray(completion?.itemTypeResults) ? completion.itemTypeResults : [];
+  const sessionResults = results.filter((result) => result?.itemType === "SESSIONS");
+  const relevant = sessionResults.length > 0 ? sessionResults : results;
+  const successes = relevant.flatMap((result) => (Array.isArray(result?.successes) ? result.successes : []));
+  const failures = relevant.flatMap((result) => (Array.isArray(result?.failures) ? result.failures : []));
+  const canonicalSource = realpathOrSelf(sourcePath);
+  const isThisSession = (entry) =>
+    typeof entry?.source === "string" &&
+    (entry.source === sourcePath || entry.source === canonicalSource || realpathOrSelf(entry.source) === canonicalSource);
+  const hasTarget = (entry) => typeof entry?.target === "string" && entry.target.length > 0;
+  const success = successes.find((entry) => hasTarget(entry) && isThisSession(entry)) ?? successes.find(hasTarget) ?? null;
+  const failure = failures.find(isThisSession) ?? failures[0] ?? null;
+  return { threadId: success?.target ?? null, failure };
 }
 
 async function startThread(client, cwd, options = {}) {
@@ -1211,8 +1262,9 @@ export async function importExternalAgentSession(cwd, options = {}) {
   return withDirectAppServer(cwd, async (client) => {
     client.setNotificationHandler(createNoticeLogger(options.onProgress));
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    let completion;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1222,7 +1274,13 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const imported = readImportedSessionResult(completion, options.sourcePath);
+    if (!imported.threadId && imported.failure) {
+      const stage = imported.failure.failureStage ? ` (${imported.failure.failureStage})` : "";
+      throw new Error(`Codex could not import the Claude session${stage}: ${imported.failure.message ?? "unknown error"}`);
+    }
+    // Older CLIs complete without results; their import ledger records the thread.
+    const threadId = imported.threadId ?? importedThreadIdForSource(options.sourcePath);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
