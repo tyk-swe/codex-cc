@@ -1,14 +1,19 @@
-name: Pull Request CI
+name: Codex Compatibility
 
+# Catches app-server protocol drift from new Codex CLI releases before users
+# do: typechecks against freshly generated bindings and drives the real
+# `codex app-server` through the plugin (no OpenAI account needed).
 on:
-  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  ci:
-    name: CI
+  latest-codex:
+    name: Latest Codex CLI
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -25,11 +30,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Pinned to the version the plugin is tested against (TESTED_CODEX_VERSION
-      # in plugins/codex/scripts/lib/codex.mjs); the weekly Codex compatibility
-      # workflow covers the latest release.
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex@0.157.1
+      - name: Install latest Codex CLI
+        run: npm install -g @openai/codex@latest
 
       - name: Show Codex version
         run: codex --version
@@ -37,7 +39,7 @@ jobs:
       - name: Run test suite
         run: npm test
 
-      - name: Run build
+      - name: Typecheck against the latest app-server protocol
         run: npm run build
 
       - name: Run live Codex smoke test

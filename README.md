@@ -324,3 +324,14 @@ Yes. If you already use Codex, the plugin picks up the same [configuration](#com
 Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
 
 If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+
+## Development
+
+```bash
+npm ci
+npm test            # unit and integration tests against a fake Codex
+npm run build       # typecheck against the protocol of the installed Codex CLI
+npm run test:live   # drive the real `codex app-server` end to end; no OpenAI account needed
+```
+
+`npm run test:live` points Codex at a local stand-in for the model API, so it needs no network access or credits. It is skipped when `codex` is not on `PATH`; set `CODEX_LIVE_REQUIRED=1` to make that a failure. CI runs it against the tested Codex version on every pull request and against the latest release every week.
