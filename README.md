@@ -5,7 +5,8 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+> [!NOTE]
+> This is a community-maintained fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc), which is no longer updated. It tracks the latest Codex CLI and GPT-6 models. The slash commands and the `codex@openai-codex` install ID are unchanged, so it is a drop-in replacement.
 
 ## What You Get
 
@@ -25,8 +26,10 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add tyk-swe/codex-cc
 ```
+
+Switching from the upstream marketplace? Both use the marketplace name `openai-codex`, so remove the old one first with `/plugin marketplace remove openai-codex`.
 
 Install the plugin:
 

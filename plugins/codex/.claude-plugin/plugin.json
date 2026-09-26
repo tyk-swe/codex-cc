@@ -4,5 +4,8 @@
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "OpenAI"
-  }
+  },
+  "homepage": "https://github.com/tyk-swe/codex-cc",
+  "repository": "https://github.com/tyk-swe/codex-cc",
+  "license": "Apache-2.0"
 }

@@ -1,7 +1,7 @@
 {
   "name": "openai-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "tyk-swe"
   },
   "metadata": {
     "description": "Codex plugins to use in Claude Code for delegation and code review.",

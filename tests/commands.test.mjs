@@ -245,6 +245,8 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
+  assert.match(readme, /\/plugin marketplace add tyk-swe\/codex-cc/);
+  assert.match(readme, /\/plugin install codex@openai-codex/);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
 });
