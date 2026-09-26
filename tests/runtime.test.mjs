@@ -15,7 +15,7 @@ import {
   teardownBrokerSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveStateDir, resolveStateFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -557,6 +557,81 @@ test("task --resume-last resumes the latest persisted task thread", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.resumeCalls.length, 1);
+  assert.equal(fakeState.resumeCalls[0].excludeTurns, true);
+});
+
+test("task --resume-last finds the task thread through thread/list when no job is tracked", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const taskThreadId = JSON.parse(fs.readFileSync(statePath, "utf8")).threads[0].id;
+
+  // Forget the tracked job so the lookup has to go through Codex's thread list.
+  fs.rmSync(resolveStateFile(repo), { force: true });
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "continue the work"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadList.sourceKinds, ["vscode", "appServer"]);
+  assert.deepEqual(fakeState.lastThreadList.modelProviders, []);
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.resumeCalls.at(-1).threadId, taskThreadId);
+});
+
+test("task --resume-last retries without excludeTurns on Codex versions that reject it", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "legacy-resume");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.resumeCalls.length, 1);
+  assert.equal("excludeTurns" in fakeState.resumeCalls[0], false);
+});
+
+test("task and review release their Codex threads when the run finishes", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+
+  const env = buildEnv(binDir);
+  const task = run("node", [SCRIPT, "task", "--json", "initial task"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  const review = run("node", [SCRIPT, "review", "--json"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.unsubscribed, [JSON.parse(task.stdout).threadId, JSON.parse(review.stdout).threadId]);
 });
 
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {

@@ -50,6 +50,7 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const QUIET_REQUEST_TIMEOUT_MS = 3000;
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -747,8 +748,62 @@ async function startThread(client, cwd, options = {}) {
   return response;
 }
 
+function isUnsupportedExcludeTurnsError(error) {
+  return /excludeTurns/.test(String(error?.message ?? ""));
+}
+
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  const params = buildResumeParams(threadId, cwd, options);
+  try {
+    // The plugin never reads thread.turns, and full-history hydration is
+    // deprecated for paginated threads.
+    return await client.request("thread/resume", { ...params, excludeTurns: true });
+  } catch (error) {
+    // Older Codex CLIs (e.g. 0.142) gate excludeTurns behind experimentalApi.
+    if (!isUnsupportedExcludeTurnsError(error)) {
+      throw error;
+    }
+    return client.request("thread/resume", params);
+  }
+}
+
+/**
+ * Best-effort request that never throws and never waits longer than
+ * `timeoutMs`. Used after a turn has finished, where a failure must not make
+ * `withAppServer` retry (and re-run) the whole task, and where `turn/interrupt`
+ * only answers once the turn has actually aborted.
+ */
+async function requestQuietly(client, method, params, timeoutMs = QUIET_REQUEST_TIMEOUT_MS) {
+  let timer = null;
+  const request = Promise.resolve()
+    .then(() => client.request(method, params))
+    .then(
+      (result) => ({ ok: true, result, error: null }),
+      (error) => ({ ok: false, result: null, error })
+    );
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ ok: false, result: null, error: new Error(`${method} timed out after ${timeoutMs}ms.`) }),
+      timeoutMs
+    );
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Release this connection's subscription so the thread can unload. While a
+ * thread stays loaded (always the case behind the shared broker), a later
+ * `thread/resume` silently ignores its sandbox and model overrides.
+ */
+async function releaseThread(client, threadId) {
+  if (threadId) {
+    await requestQuietly(client, "thread/unsubscribe", { threadId });
+  }
 }
 
 function buildResultStatus(turnState) {
@@ -1017,29 +1072,31 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
     });
-    const delivery = options.delivery ?? "inline";
 
-    const turnState = await captureTurn(
-      client,
-      sourceThreadId,
-      () =>
-        client.request("review/start", {
-          threadId: sourceThreadId,
-          delivery,
-          target: options.target
-        }),
-      {
-        onProgress: options.onProgress,
-        onResponse(response, state) {
-          if (response.reviewThreadId) {
-            state.threadIds.add(response.reviewThreadId);
-            if (delivery === "detached") {
-              state.threadId = response.reviewThreadId;
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        sourceThreadId,
+        () =>
+          client.request("review/start", {
+            threadId: sourceThreadId,
+            // Detached delivery is deprecated; inline reviews run on this thread.
+            delivery: "inline",
+            target: options.target
+          }),
+        {
+          onProgress: options.onProgress,
+          onResponse(response, state) {
+            if (response.reviewThreadId) {
+              state.threadIds.add(response.reviewThreadId);
             }
           }
         }
-      }
-    );
+      );
+    } finally {
+      await releaseThread(client, sourceThreadId);
+    }
 
     return {
       status: buildResultStatus(turnState),
@@ -1126,22 +1183,28 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
     if (!prompt) {
+      await releaseThread(client, threadId);
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress }
-    );
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        threadId,
+        () =>
+          client.request("turn/start", {
+            threadId,
+            input: buildTurnInput(prompt),
+            model: options.model ?? null,
+            effort: options.effort ?? null,
+            outputSchema: options.outputSchema ?? null
+          }),
+        { onProgress: options.onProgress }
+      );
+    } finally {
+      await releaseThread(client, threadId);
+    }
 
     return {
       status: buildResultStatus(turnState),
@@ -1170,7 +1233,11 @@ export async function findLatestTaskThread(cwd) {
       cwd,
       limit: 20,
       sortKey: "updated_at",
-      sourceKinds: ["appServer"],
+      // `codex app-server` records the threads it creates with the "vscode"
+      // source; "appServer" is kept in case that ever changes.
+      sourceKinds: ["vscode", "appServer"],
+      // Without this, only threads from the current default provider are listed.
+      modelProviders: [],
       searchTerm: TASK_THREAD_PREFIX
     });
 
