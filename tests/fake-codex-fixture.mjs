@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { writeExecutable } from "./helpers.mjs";
+import { stripInheritedEnv, writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -39,19 +39,25 @@ function now() {
   return Math.floor(Date.now() / 1000);
 }
 
+// Real \`codex app-server\` records every thread it creates with the "vscode"
+// session source, and \`thread/list\` defaults to the interactive sources.
+const THREAD_SOURCE = "vscode";
+const DEFAULT_LIST_SOURCE_KINDS = ["cli", "vscode"];
+const DEFAULT_MODEL_PROVIDER = "openai";
+
 function buildThread(thread) {
   return {
     id: thread.id,
     preview: thread.preview || "",
     ephemeral: Boolean(thread.ephemeral),
-    modelProvider: "openai",
+    modelProvider: thread.modelProvider || DEFAULT_MODEL_PROVIDER,
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt,
     status: { type: "idle" },
     path: null,
     cwd: thread.cwd,
     cliVersion: "fake-codex",
-    source: "appServer",
+    source: THREAD_SOURCE,
     agentNickname: null,
     agentRole: null,
     gitInfo: null,
@@ -328,12 +334,29 @@ rl.on("line", (line) => {
       }
 
       case "thread/list": {
+        state.lastThreadList = message.params;
+        saveState(state);
         let threads = state.threads.slice();
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);
         }
+        const sourceKinds =
+          Array.isArray(message.params.sourceKinds) && message.params.sourceKinds.length > 0
+            ? message.params.sourceKinds
+            : DEFAULT_LIST_SOURCE_KINDS;
+        if (!sourceKinds.includes(THREAD_SOURCE)) {
+          threads = [];
+        }
+        const modelProviders = message.params.modelProviders;
+        if (modelProviders == null) {
+          threads = threads.filter((thread) => (thread.modelProvider || DEFAULT_MODEL_PROVIDER) === DEFAULT_MODEL_PROVIDER);
+        } else if (modelProviders.length > 0) {
+          threads = threads.filter((thread) => modelProviders.includes(thread.modelProvider || DEFAULT_MODEL_PROVIDER));
+        }
         if (message.params.searchTerm) {
-          threads = threads.filter((thread) => (thread.name || "").includes(message.params.searchTerm));
+          threads = threads.filter((thread) =>
+            (thread.name || "").includes(message.params.searchTerm) || (thread.preview || "").includes(message.params.searchTerm)
+          );
         }
         threads.sort((left, right) => right.updatedAt - left.updatedAt);
         send({ id: message.id, result: { data: threads.map(buildThread), nextCursor: null } });
@@ -344,10 +367,31 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        if (BEHAVIOR === "legacy-resume" && requiresExperimental("excludeTurns", message, state)) {
+          send({ id: message.id, error: { code: -32600, message: "thread/resume.excludeTurns requires experimentalApi capability" } });
+          break;
+        }
+        state.resumeCalls = [...(state.resumeCalls || []), message.params];
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
+        if (message.params.excludeTurns !== true && BEHAVIOR !== "legacy-resume") {
+          send({
+            method: "deprecationNotice",
+            params: {
+              summary: "Full-history hydration is deprecated for paginated threads; use \`excludeTurns: true\`, then page with \`thread/turns/list\` and \`thread/items/list\`.",
+              details: null
+            }
+          });
+        }
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        break;
+      }
+
+      case "thread/unsubscribe": {
+        state.unsubscribed = [...(state.unsubscribed || []), message.params.threadId];
+        saveState(state);
+        send({ id: message.id, result: { status: "unsubscribed" } });
         break;
       }
 
@@ -651,8 +695,8 @@ rl.on("line", (line) => {
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
-  return {
+  return stripInheritedEnv({
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
-  };
+  });
 }

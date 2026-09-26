@@ -6,8 +6,15 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { initGitRepo, listCreatedTempDirs, makeTempDir, run } from "./helpers.mjs";
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  saveBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -15,6 +22,55 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Commands start a lazy shared broker per workspace; without this every run of
+// the suite leaves broker and fake app-server processes behind.
+async function shutdownTestBroker(cwd) {
+  let session = null;
+  try {
+    session = loadBrokerSession(cwd);
+  } catch {
+    return;
+  }
+  if (!session?.endpoint) {
+    return;
+  }
+
+  await Promise.race([
+    sendBrokerShutdown(session.endpoint).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 2000))
+  ]);
+  const pid = Number(session.pid);
+  if (Number.isFinite(pid) && pid > 0 && pid !== process.pid && isProcessAlive(pid)) {
+    try {
+      terminateProcessTree(pid);
+    } catch {
+      // Best-effort cleanup.
+    }
+  }
+  teardownBrokerSession({
+    endpoint: session.endpoint,
+    pidFile: session.pidFile ?? null,
+    logFile: session.logFile ?? null,
+    sessionDir: session.sessionDir ?? null
+  });
+  clearBrokerSession(cwd);
+}
+
+test.after(async () => {
+  for (const dir of listCreatedTempDirs()) {
+    await shutdownTestBroker(dir);
+  }
+});
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
