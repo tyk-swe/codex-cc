@@ -22,6 +22,12 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+// Unload a thread as soon as it is idle and no connection is subscribed, so a
+// finished run releases the thread's writer lock right away. With Codex's
+// 60-second default, `codex resume <thread>` elsewhere fails meanwhile with
+// "already has an active writer" while the shared broker keeps running.
+const APP_SERVER_ARGS = ["app-server", "-c", "thread_unload_delay_secs=0"];
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -198,7 +204,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    this.proc = spawn("codex", APP_SERVER_ARGS, {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],

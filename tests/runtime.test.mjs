@@ -1211,6 +1211,7 @@ test("task interrupts GPT-6 subagents that are still running when Codex finishes
     fakeState.interrupts.map((interrupt) => interrupt.threadId),
     [childThread.id]
   );
+  assert.ok(fakeState.unsubscribed.includes(childThread.id), "subagent threads are released after the run");
   assert.match(readLatestJobLog(repo), /Interrupted 1 subagent\(s\) still running when Codex finished: design_challenger\./);
 });
 

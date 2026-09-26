@@ -830,6 +830,14 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     await waitForTurnOrExit(client, state);
     await stopLeftoverSubagents(client, state);
+    // The connection is subscribed to every subagent thread; release them so
+    // they unload instead of accumulating in the shared broker. The caller
+    // releases the root thread.
+    for (const subagentThreadId of state.threadIds) {
+      if (subagentThreadId !== state.threadId) {
+        await releaseThread(client, subagentThreadId);
+      }
+    }
     return state;
   } finally {
     clearCompletionTimer(state);
