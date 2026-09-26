@@ -15,7 +15,7 @@ Execution mode:
 
 - If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
 - If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
+- If neither flag is present, default to foreground, except for `--effort ultra`: `--effort ultra` fans the task out to parallel Codex subagents and can run for a long time, so run the `codex:codex-rescue` subagent in the background.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
@@ -43,7 +43,6 @@ Operating rules:
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- `--effort ultra` fans the task out to parallel Codex subagents and can run for a long time. If the user asks for it without choosing `--wait`, run the subagent in the background.
 - Leave the model unset unless the user explicitly asks for one. Pass model IDs such as `gpt-6-sol` or `gpt-6-luna` through unchanged.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
