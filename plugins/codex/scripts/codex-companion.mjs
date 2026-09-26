@@ -21,13 +21,14 @@ import {
     interruptAppServerTurns,
     parseStructuredOutput,
     readOutputSchema,
+    releaseBrokerThreads,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isProcessRunning, terminateProcessTree, waitForProcessExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -968,6 +969,21 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+// How long /codex:cancel lets an interrupted run finish on its own, and how
+// long it then waits for a killed one to go away.
+const CANCEL_EXIT_GRACE_MS = 10000;
+const CANCEL_KILL_WAIT_MS = 2000;
+
+function recordCancellation(workspaceRoot, job, cancellation) {
+  writeJobFile(workspaceRoot, job.id, {
+    ...job,
+    ...(readStoredJob(workspaceRoot, job.id) ?? {}),
+    ...cancellation,
+    cancelledAt: cancellation.completedAt
+  });
+  upsertJob(workspaceRoot, { id: job.id, ...cancellation });
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -981,32 +997,19 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
   const subagentTurns = Array.isArray(existing.subagentTurns) ? existing.subagentTurns : [];
+  const pid = job.pid ?? Number.NaN;
+  const runWasAlive = isProcessRunning(pid);
 
   // Mark the job cancelled first so the interrupted run, when it ends, does
   // not record itself as failed.
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
+  const cancellation = {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    completedAt,
+    completedAt: nowIso(),
     errorMessage: "Cancelled by user."
   };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
+  recordCancellation(workspaceRoot, job, cancellation);
 
   // GPT-6 subagents keep running when only the root turn is interrupted, so
   // stop them first, then the root turn, over one connection.
@@ -1034,9 +1037,25 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN, { expectedCommand: /codex-companion\.mjs/ });
+  // An interrupted run winds down within moments and releases its Codex
+  // threads on the way out. Kill it only if it does not. A run that was killed
+  // (or had already died) leaves its threads loaded in the shared broker, where
+  // the next resume ignores --write or --model and `codex resume` fails with
+  // "already has an active writer", so release them here instead.
+  const exitedOnItsOwn = runWasAlive && interrupt.interrupted && (await waitForProcessExit(pid, CANCEL_EXIT_GRACE_MS));
+  if (!exitedOnItsOwn) {
+    if (runWasAlive) {
+      terminateProcessTree(pid, { expectedCommand: /codex-companion\.mjs/ });
+      await waitForProcessExit(pid, CANCEL_KILL_WAIT_MS);
+    }
+    await releaseBrokerThreads(cwd, [threadId, ...subagentTurns.map((entry) => entry.threadId)]);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
+  // The run may have rewritten the job while it wound down. It is gone now, so
+  // record the cancellation again, last.
+  recordCancellation(workspaceRoot, job, cancellation);
 
+  const nextJob = { ...job, ...cancellation };
   const payload = {
     jobId: job.id,
     status: "cancelled",

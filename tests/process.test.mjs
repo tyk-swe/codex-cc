@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { isProcessRunning, terminateProcessTree, waitForProcessExit } from "../plugins/codex/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -74,6 +75,47 @@ test("terminateProcessTree never signals a recycled pid that runs something else
 
   assert.equal(outcome.attempted, true);
   assert.equal(outcome.delivered, false);
+});
+
+function failWith(code) {
+  return () => {
+    throw Object.assign(new Error(code), { code });
+  };
+}
+
+test("isProcessRunning tells live, foreign, missing and unreaped processes apart", () => {
+  assert.equal(isProcessRunning(Number.NaN), false);
+  assert.equal(isProcessRunning(4321, { killImpl: failWith("ESRCH") }), false);
+  assert.equal(isProcessRunning(4321, { killImpl: failWith("EPERM") }), true);
+  assert.equal(isProcessRunning(4321, { killImpl: () => true, isZombieImpl: () => false }), true);
+  assert.equal(isProcessRunning(4321, { killImpl: () => true, isZombieImpl: () => true }), false);
+});
+
+test("waitForProcessExit resolves when the process exits and gives up after the timeout", async () => {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 200)"], { stdio: "ignore" });
+  assert.equal(await waitForProcessExit(child.pid, 10000, { pollMs: 20 }), true);
+
+  const started = Date.now();
+  const alive = { killImpl: () => true, isZombieImpl: () => false, pollMs: 20 };
+  assert.equal(await waitForProcessExit(4321, 150, alive), false);
+  assert.ok(Date.now() - started >= 150);
+});
+
+test("waitForProcessExit sees an orphaned process exit even when nothing reaps it", async () => {
+  // The launcher exits at once and orphans its detached child. Where init does
+  // not reap orphans (some containers), the exited child lingers as a zombie.
+  const launcher = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      'const child = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 100)"], { detached: true, stdio: "ignore" }); child.unref(); console.log(child.pid);'
+    ],
+    { encoding: "utf8" }
+  );
+  const pid = Number(launcher.stdout.trim());
+  assert.ok(Number.isInteger(pid) && pid > 0, launcher.stderr);
+
+  assert.equal(await waitForProcessExit(pid, 10000, { pollMs: 20 }), true);
 });
 
 test("terminateProcessTree treats missing Windows processes as already stopped", () => {

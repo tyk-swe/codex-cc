@@ -287,14 +287,15 @@ test("transfer imports the Claude session into a Codex thread", { skip }, async 
   assert.equal(payload.resumeCommand, `codex resume ${payload.threadId}`);
 });
 
-test("cancel interrupts a running background task", { skip }, async () => {
+test("cancel interrupts a running background task and releases its thread", { skip }, async () => {
   context.fake.setHang(true);
+  let cancelledJob;
   try {
     const launched = await runCompanion(["task", "--background", "--json", "Take your time."]);
     assert.equal(launched.status, 0, launched.stderr);
     const { jobId } = JSON.parse(launched.stdout);
 
-    await waitFor(() => {
+    cancelledJob = await waitFor(() => {
       const job = jobs().find((candidate) => candidate.id === jobId);
       return job?.status === "running" && job.turnId ? job : null;
     });
@@ -307,6 +308,13 @@ test("cancel interrupts a running background task", { skip }, async () => {
   } finally {
     context.fake.setHang(false);
   }
+
+  // Codex only applies the new sandbox if the cancelled run released the
+  // thread; otherwise the resume would silently stay read-only.
+  const resumed = await runCompanion(["task", "--resume-last", "--write", "--json", "Pick it back up."]);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(JSON.parse(resumed.stdout).threadId, cancelledJob.threadId);
+  assert.equal(context.fake.requests.at(-1).sandbox, "workspace-write");
 });
 
 test("cancel interrupts a running native review and keeps it cancelled", { skip }, async () => {

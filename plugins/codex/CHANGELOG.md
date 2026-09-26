@@ -22,11 +22,12 @@ First release of the community-maintained fork at [tyk-swe/codex-cc](https://git
 ### Fixed
 
 - `--resume-last` finds the latest task thread even when the plugin has no job history for the repository.
-- `--write` and `--model` take effect when resuming a thread that already ran in the same Claude session.
-- `codex resume <session-id>` works right after a run, without failing with "already has an active writer".
+- `--write` and `--model` take effect when resuming a thread that already ran in the same Claude session, including right after `/codex:cancel`.
+- `codex resume <session-id>` works right after a run or a cancel, without failing with "already has an active writer". `/codex:cancel` now lets the interrupted run shut down cleanly, and only kills it if it does not stop within 10 seconds.
 - Resuming a thread no longer triggers Codex's full-history deprecation notice. Older Codex versions still work.
 - Background native reviews can be cancelled.
-- Cancelled jobs stay `cancelled` instead of being marked `failed`.
+- Cancelled jobs stay `cancelled` instead of being marked `failed` or reverting to `running`.
+- Job state is written atomically, so commands running at the same time never read or leave a half-written job file.
 - Transient "Reconnecting…" errors that Codex retries no longer mark a job as failed.
 - A subagent's error no longer fails the whole task.
 - If the Codex app server exits mid-turn, the job fails right away instead of hanging.

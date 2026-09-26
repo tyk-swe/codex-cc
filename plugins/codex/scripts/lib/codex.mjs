@@ -1417,6 +1417,42 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   };
 }
 
+/**
+ * Releases the shared broker's hold on the threads of a run that was killed
+ * before it could release them itself (see releaseThread). Without a broker
+ * the killed run's own app-server exited with it, so nothing is left to do.
+ */
+export async function releaseBrokerThreads(cwd, threadIds) {
+  const ids = [...new Set((threadIds ?? []).filter(Boolean))];
+  const brokerEndpoint = process.env[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  if (ids.length === 0 || !brokerEndpoint) {
+    return [];
+  }
+
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { brokerEndpoint });
+  } catch {
+    return [];
+  }
+
+  const results = [];
+  try {
+    for (const threadId of ids) {
+      let outcome = await requestQuietly(client, "thread/unsubscribe", { threadId });
+      if (outcome.error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+        // The broker may not have seen the killed run's connection close yet.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        outcome = await requestQuietly(client, "thread/unsubscribe", { threadId });
+      }
+      results.push({ threadId, released: outcome.ok });
+    }
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return results;
+}
+
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {

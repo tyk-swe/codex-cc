@@ -2152,7 +2152,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+test("cancel interrupts a brokered task and lets it release its thread before it exits", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2204,6 +2204,13 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     threadId: runningJob.threadId,
     turnId: runningJob.turnId
   });
+  // Killed right after the interrupt, the run would leave its thread loaded in
+  // the broker, so a later resume would ignore --write or --model.
+  assert.ok(fakeState.unsubscribed?.includes(runningJob.threadId));
+  assert.match(fs.readFileSync(runningJob.logFile, "utf8"), /Turn interrupted\.[\s\S]*Cancelled by user\./);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs.find((candidate) => candidate.id === jobId)?.status, "cancelled");
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2214,6 +2221,122 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+function writeRunningJob(repo, job) {
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  const logFile = path.join(stateDir, "jobs", `${job.id}.log`);
+  fs.writeFileSync(logFile, "", "utf8");
+  const record = { status: "running", title: "Codex Task", jobClass: "task", logFile, ...job };
+  fs.writeFileSync(path.join(stateDir, "jobs", `${job.id}.json`), JSON.stringify(record, null, 2), "utf8");
+  const stateFile = path.join(stateDir, "state.json");
+  const state = fs.existsSync(stateFile)
+    ? JSON.parse(fs.readFileSync(stateFile, "utf8"))
+    : { version: 1, config: { stopReviewGate: false }, jobs: [] };
+  state.jobs.unshift({ ...record, updatedAt: new Date().toISOString() });
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), "utf8");
+  return record;
+}
+
+test("cancel releases the broker's threads for a run it had to kill", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  // A finished task starts the shared broker and leaves a thread behind.
+  const task = run("node", [SCRIPT, "task", "--json", "check the build"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  const { threadId } = JSON.parse(task.stdout);
+
+  // A run caught before its turn started cannot be interrupted, so cancel
+  // kills it; it never got to release the thread it had opened.
+  const stuckRun = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+  stuckRun.unref();
+  t.after(() => {
+    try {
+      process.kill(-stuckRun.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  writeRunningJob(repo, { id: "task-stuck", pid: stuckRun.pid, threadId });
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  fs.writeFileSync(fakeStatePath, JSON.stringify({ ...fakeState, unsubscribed: [] }, null, 2));
+
+  const cancel = run("node", [SCRIPT, "cancel", "task-stuck", "--json"], { cwd: repo, env });
+
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.equal(JSON.parse(cancel.stdout).turnInterruptAttempted, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).unsubscribed, [threadId]);
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("cancel records the cancellation after the run stops writing to the job", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  const record = writeRunningJob(repo, { id: "task-busy" });
+  const jobFile = path.join(stateDir, "jobs", "task-busy.json");
+
+  // Stands in for a run whose progress updates keep rewriting the job as
+  // running, as a busy Codex turn does.
+  const busyRun = spawn(
+    process.execPath,
+    [
+      "-e",
+      `
+      const fs = require("node:fs");
+      const [jobFile, stateFile, record] = [process.argv[1], process.argv[2], JSON.parse(process.argv[3])];
+      function writeAtomic(file, text) {
+        fs.writeFileSync(file + ".busy", text);
+        fs.renameSync(file + ".busy", file);
+      }
+      const running = { status: "running", pid: process.pid };
+      setInterval(() => {
+        writeAtomic(jobFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(jobFile, "utf8")), ...running }));
+        const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+        state.jobs = state.jobs.map((job) => (job.id === record.id ? { ...job, ...running } : job));
+        writeAtomic(stateFile, JSON.stringify(state));
+      }, 2);
+      `,
+      jobFile,
+      path.join(stateDir, "state.json"),
+      JSON.stringify(record)
+    ],
+    { detached: true, stdio: "ignore" }
+  );
+  busyRun.unref();
+  t.after(() => {
+    try {
+      process.kill(-busyRun.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  });
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    return state.jobs.find((job) => job.id === "task-busy")?.pid === busyRun.pid;
+  });
+
+  const cancel = run("node", [SCRIPT, "cancel", "task-busy", "--json"], { cwd: repo });
+
+  assert.equal(cancel.status, 0, cancel.stderr);
+  const finalState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(finalState.jobs.find((job) => job.id === "task-busy")?.status, "cancelled");
+  assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).status, "cancelled");
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,4 +103,49 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("writeJobFile never exposes a partly written job file to other processes", async () => {
+  const workspace = makeTempDir();
+  const jobFile = resolveJobFile(workspace, "job-atomic");
+  const stateModule = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+  // Alternating long and short payloads make a torn or truncated read fail to parse.
+  const writer = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+      const { writeJobFile } = await import(${JSON.stringify(stateModule)});
+      const long = { id: "job-atomic", status: "running", log: "x".repeat(256 * 1024) };
+      const short = { id: "job-atomic", status: "cancelled" };
+      for (let index = 0; index < 200; index += 1) {
+        writeJobFile(${JSON.stringify(workspace)}, "job-atomic", index % 2 ? short : long);
+      }
+      `
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] }
+  );
+  let stderr = "";
+  writer.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exited = new Promise((resolve) => writer.on("close", resolve));
+  let done = false;
+  exited.then(() => {
+    done = true;
+  });
+
+  let reads = 0;
+  while (!done) {
+    if (fs.existsSync(jobFile)) {
+      assert.equal(JSON.parse(fs.readFileSync(jobFile, "utf8")).id, "job-atomic");
+      reads += 1;
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(await exited, 0, stderr);
+  assert.ok(reads > 0);
+  assert.deepEqual(fs.readdirSync(path.dirname(jobFile)), ["job-atomic.json"]);
 });

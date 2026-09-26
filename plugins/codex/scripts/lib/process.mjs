@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
@@ -127,6 +128,49 @@ export function terminateProcessTree(pid, options = {}) {
 function processCommandMatches(pid, pattern, runCommandImpl) {
   const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)], { shell: false });
   return !result.error && result.status === 0 && pattern.test(result.stdout);
+}
+
+// An exited process that nobody reaped yet still answers signal 0. Detached
+// jobs become such zombies in containers whose init does not reap orphans.
+function isZombieProcess(pid) {
+  if (process.platform !== "linux") {
+    return false;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.charAt(stat.lastIndexOf(")") + 2) === "Z";
+  } catch {
+    return false;
+  }
+}
+
+export function isProcessRunning(pid, options = {}) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(pid, 0);
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+  return !(options.isZombieImpl ?? isZombieProcess)(pid);
+}
+
+/**
+ * Resolves true once `pid` has exited (or was never a valid pid), and false
+ * if it is still running after `timeoutMs`.
+ */
+export async function waitForProcessExit(pid, timeoutMs, options = {}) {
+  const pollMs = options.pollMs ?? 100;
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessRunning(pid, options)) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return true;
 }
 
 export function formatCommandFailure(result) {

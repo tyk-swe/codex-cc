@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -168,6 +168,16 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// /codex:cancel records the cancellation in both the job file and the job
+// index. This run's own progress updates can race with that and restore
+// "running" in one of them, so either one saying "cancelled" is enough.
+function isJobCancelled(workspaceRoot, jobId) {
+  return (
+    readStoredJobOrNull(workspaceRoot, jobId)?.status === "cancelled" ||
+    listJobs(workspaceRoot).some((entry) => entry.id === jobId && entry.status === "cancelled")
+  );
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -182,7 +192,7 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
-    if (readStoredJobOrNull(job.workspaceRoot, job.id)?.status === "cancelled") {
+    if (isJobCancelled(job.workspaceRoot, job.id)) {
       // /codex:cancel already finalized this job; the interrupted run ending
       // afterwards must not relabel it as failed.
       return execution;
@@ -214,10 +224,10 @@ export async function runTrackedJob(job, runner, options = {}) {
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    if (existing.status === "cancelled") {
+    if (isJobCancelled(job.workspaceRoot, job.id)) {
       throw error;
     }
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
