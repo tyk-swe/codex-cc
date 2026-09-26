@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { cleanCodexStderr } from "../plugins/codex/scripts/lib/codex.mjs";
+import {
+  cleanCodexStderr,
+  isCodexVersionBelow,
+  parseCodexVersion,
+  TESTED_CODEX_VERSION
+} from "../plugins/codex/scripts/lib/codex.mjs";
 
 test("cleanCodexStderr strips ANSI colours and the Codex PATH warnings", () => {
   const raw = [
@@ -21,4 +26,18 @@ test("cleanCodexStderr strips ANSI colours and the Codex PATH warnings", () => {
 test("cleanCodexStderr tolerates missing stderr", () => {
   assert.equal(cleanCodexStderr(undefined), "");
   assert.equal(cleanCodexStderr(""), "");
+});
+
+test("parseCodexVersion reads `codex --version` output and compares against the tested version", () => {
+  assert.deepEqual(parseCodexVersion("codex-cli 0.157.1; advanced runtime available"), {
+    major: 0,
+    minor: 157,
+    patch: 1,
+    raw: "0.157.1"
+  });
+  assert.equal(parseCodexVersion("codex-cli test"), null);
+  assert.equal(isCodexVersionBelow(parseCodexVersion("codex-cli 0.142.5")), true);
+  assert.equal(isCodexVersionBelow(parseCodexVersion(`codex-cli ${TESTED_CODEX_VERSION}`)), false);
+  assert.equal(isCodexVersionBelow(parseCodexVersion("codex-cli 1.0.0")), false);
+  assert.equal(isCodexVersionBelow(null), false);
 });

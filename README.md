@@ -18,6 +18,7 @@ they already have.
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later**
+- **Codex CLI 0.157 or later** is recommended (`npm install -g @openai/codex@latest`, or `codex update`). Older versions still work, but lack the GPT-6 models and some protocol features; `/codex:setup` tells you when to update.
 
 ## Install
 
@@ -145,8 +146,9 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
+/codex:rescue --model gpt-6-luna --effort medium investigate the flaky integration test
+/codex:rescue --model gpt-6-sol fix the issue quickly
+/codex:rescue --background --effort ultra untangle the failing migration across services
 /codex:rescue --background investigate the regression
 ```
 
@@ -158,8 +160,9 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- if you do not pass `--model` or `--effort`, Codex chooses its own defaults (currently `gpt-6-astra`).
+- `--model` takes any model ID Codex knows and passes it through unchanged, for example `gpt-6-astra`, `gpt-6-sol` or `gpt-6-luna` (the fastest and cheapest).
+- `--effort` accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` and `ultra`; which ones work depends on the model. GPT-6 models take `low` through `max`, and Astra and Sol also take `ultra`, which fans the task out to parallel Codex subagents and can run for a long time, so pair it with `--background`.
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
@@ -270,10 +273,10 @@ The Codex plugin wraps the [Codex app server](https://developers.openai.com/code
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-6-sol` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
 
 ```toml
-model = "gpt-5.4-mini"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 ```
 

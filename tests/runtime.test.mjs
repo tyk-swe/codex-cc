@@ -98,6 +98,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.ready, true);
   assert.match(payload.codex.detail, /advanced runtime available/);
   assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.nextSteps.some((step) => /Update Codex/.test(step)), false);
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
@@ -944,15 +945,45 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--model", "gpt-6-luna", "--effort", "max", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
-  assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-luna");
+  assert.equal(fakeState.lastTurnStart.effort, "max");
+});
+
+test("task passes model ids through verbatim instead of expanding aliases", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "ultra", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.model, "spark");
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+});
+
+test("setup suggests updating Codex when the CLI is older than the tested version", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "old-cli");
+
+  const result = run("node", [SCRIPT, "setup", "--json"], { cwd: ROOT, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.ok(
+    payload.nextSteps.some((step) => /Update Codex with `npm install -g @openai\/codex@latest`.*you have 0\.142\.5/.test(step)),
+    JSON.stringify(payload.nextSteps)
+  );
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {

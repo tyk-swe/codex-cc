@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -10,6 +12,22 @@ const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
+
+test("documented reasoning efforts match the ones the companion accepts", () => {
+  const usage = spawnSync(process.execPath, [path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "help"], {
+    encoding: "utf8"
+  });
+  assert.equal(usage.status, 0, usage.stderr);
+  const accepted = /--effort <([a-z|]+)>/.exec(usage.stdout)?.[1];
+  assert.ok(accepted, usage.stdout);
+
+  assert.equal(/--effort <([a-z|]+)>/.exec(read("commands/rescue.md"))?.[1], accepted);
+  const skillSentence = /`--effort`: accepted values are ([^.]+)\./.exec(read("skills/codex-cli-runtime/SKILL.md"))?.[1] ?? "";
+  assert.equal(
+    [...skillSentence.matchAll(/`([a-z]+)`/g)].map((match) => match[1]).join("|"),
+    accepted
+  );
+});
 
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
@@ -103,8 +121,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
-  assert.match(rescue, /--model <model\|spark>/);
-  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
+  assert.match(rescue, /--model <model>/);
+  assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
@@ -114,7 +132,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
-  assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
+  assert.match(rescue, /Pass model IDs such as `gpt-6-sol` or `gpt-6-luna` through unchanged/i);
+  assert.match(rescue, /`--effort ultra` fans the task out to parallel Codex subagents/i);
+  assert.doesNotMatch(rescue, /spark/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
   assert.match(rescue, /If the user chooses continue, add `--resume`/i);
@@ -134,8 +154,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
-  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
+  assert.match(agent, /If the user asks for a concrete model name such as `gpt-6-luna`, pass it through with `--model` unchanged/i);
+  assert.doesNotMatch(agent, /spark/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(agent, /gpt-5-4-prompting/);
@@ -147,16 +167,18 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
-  assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /pass it through to `task` unchanged/i);
+  assert.doesNotMatch(runtimeSkill, /spark/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
-  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
+  assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
-  assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
-  assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
+  assert.match(readme, /--model gpt-6-luna --effort medium/i);
+  assert.match(readme, /--background --effort ultra/i);
+  assert.doesNotMatch(readme, /spark|gpt-5\.4/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /### `\/codex:setup`/);
   assert.match(readme, /### `\/codex:review`/);

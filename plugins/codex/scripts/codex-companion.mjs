@@ -15,6 +15,9 @@ import {
     getCodexAvailability,
     getSessionRuntimeStatus,
     importExternalAgentSession,
+    isCodexVersionBelow,
+    parseCodexVersion,
+    TESTED_CODEX_VERSION,
     interruptAppServerTurns,
     parseStructuredOutput,
     readOutputSchema,
@@ -68,8 +71,9 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// Codex forwards any effort string; which ones a model accepts depends on the
+// model (GPT-6: low…max, plus ultra on Astra and Sol). This catches typos.
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -79,7 +83,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      `  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <${[...VALID_REASONING_EFFORTS].join("|")}>] [prompt]`,
+      `  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <${[...VALID_REASONING_EFFORTS].join("|")}>] [prompt]`,
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -105,10 +109,8 @@ function normalizeRequestedModel(model) {
     return null;
   }
   const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  // Model ids are passed to Codex verbatim (e.g. gpt-6-sol, gpt-6-luna).
+  return normalized || null;
 }
 
 function normalizeReasoningEffort(effort) {
@@ -190,6 +192,12 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const nextSteps = [];
   if (!codexStatus.available) {
     nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+  }
+  const codexVersion = codexStatus.available ? parseCodexVersion(codexStatus.detail) : null;
+  if (isCodexVersionBelow(codexVersion)) {
+    nextSteps.push(
+      `Update Codex with \`npm install -g @openai/codex@latest\` (or \`codex update\`); this plugin is tested with Codex CLI ${TESTED_CODEX_VERSION} or later and you have ${codexVersion.raw}.`
+    );
   }
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");

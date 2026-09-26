@@ -1229,6 +1229,33 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+// Oldest Codex CLI this plugin is tested against (GPT-6 models, excludeTurns).
+// Older CLIs keep working through fallbacks; /codex:setup suggests updating.
+export const TESTED_CODEX_VERSION = "0.157.0";
+
+/** Parses "codex-cli 0.157.1" (as printed by `codex --version`). */
+export function parseCodexVersion(text) {
+  const match = /\bcodex-cli\s+v?(\d+)\.(\d+)\.(\d+)/.exec(String(text ?? ""));
+  if (!match) {
+    return null;
+  }
+  const [major, minor, patch] = match.slice(1, 4).map(Number);
+  return { major, minor, patch, raw: `${major}.${minor}.${patch}` };
+}
+
+export function isCodexVersionBelow(version, minimum = TESTED_CODEX_VERSION) {
+  const floor = parseCodexVersion(`codex-cli ${minimum}`);
+  if (!version || !floor) {
+    return false;
+  }
+  for (const key of ["major", "minor", "patch"]) {
+    if (version[key] !== floor[key]) {
+      return version[key] < floor[key];
+    }
+  }
+  return false;
+}
+
 export function getCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
