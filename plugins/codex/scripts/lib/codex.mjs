@@ -25,6 +25,7 @@
  *   activeSubagentTurns: Set<string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
  *   lastAgentMessage: string,
+ *   lastAsyncMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
  *   error: unknown,
@@ -52,12 +53,40 @@ const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 const QUIET_REQUEST_TIMEOUT_MS = 3000;
 
-function cleanCodexStderr(stderr) {
-  return stderr
+// CSI escape sequences; Codex colours its tracing output even when piped.
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+// "…could not update PATH:" (older CLIs) and "…could not create PATH aliases:".
+const PATH_WARNING_PREFIX = "WARNING: proceeding, even though we could not";
+
+export function cleanCodexStderr(stderr) {
+  return String(stderr ?? "")
+    .replace(ANSI_ESCAPE_PATTERN, "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
-    .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
+    .filter((line) => line && !line.startsWith(PATH_WARNING_PREFIX))
     .join("\n");
+}
+
+/**
+ * Base notification handler for a run: records Codex deprecation notices and
+ * connection-level warnings in the job log. `captureTurn` forwards every
+ * notification it does not consume to this handler.
+ */
+function createNoticeLogger(onProgress) {
+  return (message) => {
+    if (message?.method === "deprecationNotice") {
+      const details = message.params?.details ?? null;
+      emitLogEvent(onProgress, {
+        message: `Codex deprecation notice: ${message.params?.summary ?? ""}`.trim(),
+        logTitle: details ? "Codex deprecation notice" : null,
+        logBody: details
+      });
+      return;
+    }
+    if (message?.method === "warning" && !message.params?.threadId) {
+      emitLogEvent(onProgress, { message: `Codex warning: ${message.params?.message ?? ""}`.trim() });
+    }
+  };
 }
 
 /** @returns {ThreadStartParams} */
@@ -327,6 +356,7 @@ function createTurnCaptureState(threadId, options = {}) {
     activeSubagentTurns: new Set(),
     completionTimer: null,
     lastAgentMessage: "",
+    lastAsyncMessage: "",
     reviewText: "",
     reasoningSummary: [],
     error: null,
@@ -356,6 +386,9 @@ function completeTurn(state, turn = null, options = {}) {
     state.finalTurn = turn;
     if (!state.turnId) {
       state.turnId = turn.id;
+    }
+    if (turn.error && !state.error) {
+      state.error = turn.error;
     }
   } else if (!state.finalTurn) {
     state.finalTurn = {
@@ -417,6 +450,25 @@ function recordItem(state, item, lifecycle, threadId = null) {
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
       registerThread(state, receiverThreadId);
     }
+  }
+
+  if (item.type === "agentMessage" && item.delivery === "async") {
+    // Mid-turn update from an async tool (send_message_to_user_async,
+    // request_user_input_async). It can carry phase "final_answer" but is not
+    // the turn's answer, so it must not end or become the captured output.
+    if (lifecycle === "completed" && item.text) {
+      if (!threadId || threadId === state.threadId) {
+        state.lastAsyncMessage = item.text;
+      }
+      const sourceLabel = labelForThread(state, threadId);
+      emitLogEvent(state.onProgress, {
+        message: sourceLabel ? `Subagent ${sourceLabel} update: ${shorten(item.text, 96)}` : `Codex update: ${shorten(item.text, 96)}`,
+        stderrMessage: null,
+        logTitle: sourceLabel ? `Subagent ${sourceLabel} update` : "Codex update",
+        logBody: item.text
+      });
+    }
+    return;
   }
 
   if (item.type === "agentMessage") {
@@ -508,18 +560,16 @@ function applyTurnNotification(state, message) {
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.add(message.params.threadId);
+        emitProgress(
+          state.onProgress,
+          `Subagent ${labelForThread(state, message.params.threadId)} turn started (${message.params.turn.id}).`
+        );
+        break;
       }
-      emitProgress(
-        state.onProgress,
-        `Turn started (${message.params.turn.id}).`,
-        "starting",
-        (message.params.threadId ?? null) === state.threadId
-          ? {
-              threadId: message.params.threadId ?? null,
-              turnId: message.params.turn.id ?? null
-            }
-          : {}
-      );
+      emitProgress(state.onProgress, `Turn started (${message.params.turn.id}).`, "starting", {
+        threadId: message.params.threadId ?? null,
+        turnId: message.params.turn.id ?? null
+      });
       break;
     case "item/started":
       recordItem(state, message.params.item, "started", message.params.threadId ?? null);
@@ -535,10 +585,32 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
+    case "error": {
+      const errorMessage = message.params.error?.message ?? "unknown error";
+      if (message.params.willRetry) {
+        // Transient stream retry ("Reconnecting... 2/5"); the turn goes on.
+        emitProgress(state.onProgress, `Codex retrying: ${errorMessage}`);
+        break;
+      }
+      const errorThreadId = message.params.threadId ?? null;
+      if (errorThreadId && errorThreadId !== state.threadId) {
+        // A subagent failing does not fail the task; the root turn decides.
+        emitProgress(state.onProgress, `Subagent ${labelForThread(state, errorThreadId)} error: ${errorMessage}`);
+        break;
+      }
       state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+      emitProgress(state.onProgress, `Codex error: ${errorMessage}`, "failed");
       break;
+    }
+    case "warning": {
+      const sourceLabel = labelForThread(state, message.params.threadId ?? null);
+      emitLogEvent(state.onProgress, {
+        message: sourceLabel
+          ? `Subagent ${sourceLabel} warning: ${message.params.message}`
+          : `Codex warning: ${message.params.message}`
+      });
+      break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
@@ -604,11 +676,25 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    return await waitForTurnOrExit(client, state);
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+// A turn only ends with turn/completed; if the connection to Codex goes away
+// first, fail instead of waiting forever.
+function waitForTurnOrExit(client, state) {
+  const exited = client.exitPromise.then(() => {
+    if (state.completed) {
+      return state;
+    }
+    const stderr = cleanCodexStderr(client.stderr);
+    throw client.exitError ?? new Error(`codex app-server exited before the turn completed.${stderr ? `\n${stderr}` : ""}`);
+  });
+  exited.catch(() => {});
+  return Promise.race([state.completion, exited]);
 }
 
 async function withAppServer(cwd, fn) {
@@ -1061,6 +1147,7 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1122,6 +1209,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
   }
 
   return withDirectAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
@@ -1156,6 +1244,7 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1210,7 +1299,8 @@ export async function runAppServerTurn(cwd, options = {}) {
       status: buildResultStatus(turnState),
       threadId,
       turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
+      // A turn that ends without a regular answer still reports its last update.
+      finalMessage: turnState.lastAgentMessage || turnState.lastAsyncMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,

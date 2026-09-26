@@ -99,7 +99,10 @@ async function main() {
     }
   }
 
+  let shuttingDown = false;
+
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -231,6 +234,16 @@ async function main() {
       sockets.delete(socket);
       clearSocketOwnership(socket);
     });
+  });
+
+  appClient.exitPromise.then(async () => {
+    if (shuttingDown) {
+      return;
+    }
+    // Without its app-server the broker can never answer again. Drop every
+    // client so in-flight turns fail fast; the next command starts a new broker.
+    await shutdown(server);
+    process.exit(1);
   });
 
   process.on("SIGTERM", async () => {

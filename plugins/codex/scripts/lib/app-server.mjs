@@ -33,11 +33,17 @@ const DEFAULT_CLIENT_INFO = {
 const DEFAULT_CAPABILITIES = {
   experimentalApi: false,
   requestAttestation: false,
+  // Streaming updates the plugin never reads; completed items carry the
+  // final content. Unknown method names are ignored by older app-servers.
   optOutNotificationMethods: [
     "item/agentMessage/delta",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/summaryPartAdded",
-    "item/reasoning/textDelta"
+    "item/reasoning/textDelta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/plan/delta",
+    "turn/diff/updated"
   ]
 };
 
@@ -86,6 +92,11 @@ class AppServerClientBase {
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
+    }
+    if (this.exitResolved) {
+      // handleExit already rejected everything pending; a new request would
+      // otherwise wait forever.
+      return Promise.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
 
     const id = this.nextId;
@@ -197,6 +208,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
+    // Writing to a dead app-server raises EPIPE; the exit handler reports it.
+    this.proc.stdin.on("error", () => {});
 
     this.proc.stderr.on("data", (chunk) => {
       this.stderr += chunk;

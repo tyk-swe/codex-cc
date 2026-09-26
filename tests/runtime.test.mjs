@@ -1003,6 +1003,111 @@ test("task ignores later subagent messages when choosing the final returned outp
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+function makeRepoWithCommit() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+function readLatestJobLog(repo) {
+  const state = JSON.parse(fs.readFileSync(resolveStateFile(repo), "utf8"));
+  return fs.readFileSync(state.jobs[0].logFile, "utf8");
+}
+
+test("task treats Codex reconnect retries as progress, not as a failure", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "retrying-task");
+
+  const result = run("node", [SCRIPT, "task", "check the flaky network path"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const log = readLatestJobLog(repo);
+  assert.match(log, /Codex retrying: Reconnecting\.\.\. 1\/5/);
+  assert.doesNotMatch(log, /Codex error:/);
+});
+
+test("task does not fail when only a subagent reports an error", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "child-error");
+
+  const result = run("node", [SCRIPT, "task", "--json", "challenge the current design"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, 0);
+  assert.equal(payload.rawOutput, "Handled the requested task.\nTask prompt accepted.");
+  const log = readLatestJobLog(repo);
+  assert.match(log, /Subagent design-challenger error: subagent could not read the fixtures/);
+  assert.doesNotMatch(log, /Codex error:/);
+});
+
+test("task never returns an async progress message as the final answer", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "async-final-message");
+
+  const result = run("node", [SCRIPT, "task", "summarize the design"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.match(readLatestJobLog(repo), /Codex update: Still working; I will report back shortly\./);
+});
+
+test("task fails promptly when the Codex app-server dies mid-turn", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "crash-mid-turn");
+
+  const result = run("node", [SCRIPT, "task", "investigate the crash"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    timeout: 20000
+  });
+
+  assert.equal(result.error, undefined, "the task hung instead of failing");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /exited/);
+});
+
+test("task records Codex deprecation notices in the job log", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "deprecation-on-turn");
+
+  const result = run("node", [SCRIPT, "task", "check deprecations"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const log = readLatestJobLog(repo);
+  assert.match(log, /Codex deprecation notice: The fake feature is deprecated\./);
+  assert.match(log, /Use the replacement instead\./);
+});
+
+test("app-server connections opt out of streaming notifications the plugin never reads", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "anything"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  for (const method of [
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/plan/delta",
+    "turn/diff/updated"
+  ]) {
+    assert.ok(fakeState.capabilities.optOutNotificationMethods.includes(method), method);
+  }
+});
+
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

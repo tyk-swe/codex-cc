@@ -1,7 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderNativeReviewResult, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+
+test("renderNativeReviewResult only shows Codex stderr when the review failed", () => {
+  const meta = { reviewLabel: "Review", targetLabel: "working tree diff" };
+  const succeeded = renderNativeReviewResult(
+    { status: 0, stdout: "No material issues found.", stderr: "ERROR codex_app_server: Codex could not find bubblewrap on PATH." },
+    meta
+  );
+  assert.match(succeeded, /No material issues found\./);
+  assert.doesNotMatch(succeeded, /stderr:/);
+  assert.doesNotMatch(succeeded, /bubblewrap/);
+
+  const failed = renderNativeReviewResult({ status: 1, stdout: "", stderr: "unexpected status 401 Unauthorized" }, meta);
+  assert.match(failed, /Codex review failed\./);
+  assert.match(failed, /stderr:/);
+  assert.match(failed, /401 Unauthorized/);
+});
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(

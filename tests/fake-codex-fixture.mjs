@@ -501,11 +501,59 @@ rl.on("line", (line) => {
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+        const finalAnswer = { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" };
+
+        if (BEHAVIOR === "crash-mid-turn") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          process.stderr.write("fatal: simulated app-server crash\\n");
+          setTimeout(() => process.exit(3), 20);
+          break;
+        }
+
+        if (BEHAVIOR === "retrying-task") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          for (const attempt of [1, 2]) {
+            send({
+              method: "error",
+              params: {
+                threadId: thread.id,
+                turnId,
+                willRetry: true,
+                error: { message: "Reconnecting... " + attempt + "/5", codexErrorInfo: null, additionalDetails: null }
+              }
+            });
+          }
+          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          break;
+        }
+
+        if (BEHAVIOR === "async-final-message") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: thread.id,
+              turnId,
+              item: { type: "agentMessage", id: "async_" + turnId, text: "Still working; I will report back shortly.", phase: "final_answer", delivery: "async" }
+            }
+          });
+          setTimeout(() => {
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 600);
+          break;
+        }
+
+        if (BEHAVIOR === "deprecation-on-turn") {
+          send({ method: "deprecationNotice", params: { summary: "The fake feature is deprecated.", details: "Use the replacement instead." } });
+        }
 
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
+          BEHAVIOR === "with-subagent-no-main-turn-completed" ||
+          BEHAVIOR === "child-error"
         ) {
           const subThread = nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
@@ -573,7 +621,21 @@ rl.on("line", (line) => {
               }
             }
           });
-          send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+          if (BEHAVIOR === "child-error") {
+            send({
+              method: "error",
+              params: {
+                threadId: subThread.id,
+                turnId: subTurnId,
+                willRetry: false,
+                error: { message: "subagent could not read the fixtures", codexErrorInfo: null, additionalDetails: null }
+              }
+            });
+          }
+          send({
+            method: "turn/completed",
+            params: { threadId: subThread.id, turn: buildTurn(subTurnId, BEHAVIOR === "child-error" ? "failed" : "completed") }
+          });
           send({
             method: "item/completed",
             params: {
