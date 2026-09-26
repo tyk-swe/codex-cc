@@ -15,7 +15,7 @@ import {
     getCodexAvailability,
     getSessionRuntimeStatus,
     importExternalAgentSession,
-    interruptAppServerTurn,
+    interruptAppServerTurns,
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
@@ -972,20 +972,10 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  const subagentTurns = Array.isArray(existing.subagentTurns) ? existing.subagentTurns : [];
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
-        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
-  }
-
-  terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
-
+  // Mark the job cancelled first so the interrupted run, when it ends, does
+  // not record itself as failed.
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -1010,12 +1000,46 @@ async function handleCancel(argv) {
     completedAt
   });
 
+  // GPT-6 subagents keep running when only the root turn is interrupted, so
+  // stop them first, then the root turn, over one connection.
+  const hasRootTurn = Boolean(threadId && turnId);
+  const interrupts = await interruptAppServerTurns(cwd, [...subagentTurns, ...(hasRootTurn ? [{ threadId, turnId }] : [])]);
+  const interrupt = hasRootTurn
+    ? interrupts.at(-1)
+    : { attempted: false, interrupted: false, detail: "missing threadId or turnId" };
+  const subagentInterrupts = hasRootTurn ? interrupts.slice(0, -1) : interrupts;
+
+  for (const result of subagentInterrupts) {
+    appendLogLine(
+      job.logFile,
+      result.interrupted
+        ? `Requested subagent turn interrupt for ${result.turnId} on ${result.threadId}.`
+        : `Subagent turn interrupt failed${result.detail ? `: ${result.detail}` : "."}`
+    );
+  }
+  if (interrupt.attempted) {
+    appendLogLine(
+      job.logFile,
+      interrupt.interrupted
+        ? `Requested Codex turn interrupt for ${turnId} on ${threadId}.`
+        : `Codex turn interrupt failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
+    );
+  }
+
+  terminateProcessTree(job.pid ?? Number.NaN, { expectedCommand: /codex-companion\.mjs/ });
+  appendLogLine(job.logFile, "Cancelled by user.");
+
   const payload = {
     jobId: job.id,
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    subagentInterrupts: subagentInterrupts.map(({ threadId: subagentThreadId, turnId: subagentTurnId, interrupted }) => ({
+      threadId: subagentThreadId,
+      turnId: subagentTurnId,
+      interrupted
+    }))
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);

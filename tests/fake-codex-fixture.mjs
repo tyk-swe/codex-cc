@@ -166,9 +166,10 @@ function saveImportLedger(ledger) {
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
 }
 
-function emitTurnCompleted(threadId, turnId, item) {
+function emitTurnCompleted(threadId, turnId, item, options = {}) {
   const items = Array.isArray(item) ? item : [item];
-  send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
+  // Real inline reviews announce the review delegate's turn id in turn/started.
+  send({ method: "turn/started", params: { threadId, turn: buildTurn(options.startedTurnId || turnId) } });
   for (const entry of items) {
     if (entry && entry.started) {
       send({ method: "item/started", params: { threadId, turnId, item: entry.started } });
@@ -513,7 +514,22 @@ rl.on("line", (line) => {
           send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
         }
         const turnId = nextTurnId(state);
+        const delegateTurnId = turnId + "_delegate";
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
+        if (BEHAVIOR === "interruptible-slow-review") {
+          send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(delegateTurnId) } });
+          send({
+            method: "item/started",
+            params: { threadId: reviewThread.id, turnId, item: { type: "enteredReviewMode", id: turnId, review: "current changes" } }
+          });
+          const timer = setTimeout(() => {
+            interruptibleTurns.delete(delegateTurnId);
+            send({ method: "turn/completed", params: { threadId: reviewThread.id, turn: buildTurn(turnId, "completed") } });
+          }, 8000);
+          // Like real Codex, only the delegate's turn id is interruptible.
+          interruptibleTurns.set(delegateTurnId, { threadId: reviewThread.id, timer, completedTurnId: turnId });
+          break;
+        }
         emitTurnCompleted(reviewThread.id, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
@@ -533,7 +549,7 @@ rl.on("line", (line) => {
           {
             completed: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) }
           }
-        ]);
+        ], { startedTurnId: delegateTurnId });
         break;
       }
 
@@ -604,6 +620,85 @@ rl.on("line", (line) => {
 
         if (BEHAVIOR === "deprecation-on-turn") {
           send({ method: "deprecationNotice", params: { summary: "The fake feature is deprecated.", details: "Use the replacement instead." } });
+        }
+
+        // Multi-agent v2 (GPT-6): subagents are announced only by subAgentActivity
+        // items on the parent thread; there is no thread/started for them.
+        if (
+          BEHAVIOR === "with-v2-subagent" ||
+          BEHAVIOR === "with-v2-subagent-still-running" ||
+          BEHAVIOR === "interruptible-slow-task-with-subagent"
+        ) {
+          const childThread = nextThread(state, thread.cwd, true);
+          const childTurnId = nextTurnId(state);
+          const agentPath = "/root/design_challenger";
+          const activity = (kind) => ({ type: "subAgentActivity", id: "activity_" + kind + "_" + childTurnId, kind, agentThreadId: childThread.id, agentPath });
+          const childMessage = (id, text) => ({ type: "agentMessage", id, text, phase: null });
+          const announceChild = () => {
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: activity("started") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: activity("started") } });
+          };
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+
+          if (BEHAVIOR === "with-v2-subagent") {
+            // The child's first events race ahead of the parent's subAgentActivity item.
+            send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(childTurnId) } });
+            send({
+              method: "item/completed",
+              params: { threadId: childThread.id, turnId: childTurnId, item: childMessage("msg_" + childTurnId, "Early finding from the child.") }
+            });
+            announceChild();
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(childTurnId, "completed") } });
+            // A follow-up task runs a second turn on the same child thread.
+            const followUpTurnId = nextTurnId(state);
+            send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(followUpTurnId) } });
+            send({
+              method: "item/completed",
+              params: { threadId: childThread.id, turnId: followUpTurnId, item: childMessage("msg_" + followUpTurnId, "Follow-up detail from the child.") }
+            });
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(followUpTurnId, "completed") } });
+            const waitItem = (status) => ({
+              type: "collabAgentToolCall",
+              id: "wait_" + turnId,
+              tool: "wait",
+              status,
+              senderThreadId: thread.id,
+              receiverThreadIds: [],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
+              agentsStates: {}
+            });
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: waitItem("inProgress") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: waitItem("completed") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            break;
+          }
+
+          announceChild();
+          send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(childTurnId) } });
+          const childTimer = setTimeout(() => {
+            interruptibleTurns.delete(childTurnId);
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(childTurnId, "completed") } });
+          }, 8000);
+          interruptibleTurns.set(childTurnId, { threadId: childThread.id, timer: childTimer });
+
+          if (BEHAVIOR === "with-v2-subagent-still-running") {
+            // The root answers and finishes while its subagent is still working.
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            break;
+          }
+
+          // interruptible-slow-task-with-subagent: root and child both keep running.
+          const rootTimer = setTimeout(() => {
+            interruptibleTurns.delete(turnId);
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 8000);
+          interruptibleTurns.set(turnId, { threadId: thread.id, timer: rootTimer });
+          break;
         }
 
         if (
@@ -776,20 +871,32 @@ rl.on("line", (line) => {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
+	        state.interrupts = [...(state.interrupts || []), state.lastInterrupt];
 	        saveState(state);
 	        const pending = interruptibleTurns.get(message.params.turnId);
-	        if (pending) {
-	          clearTimeout(pending.timer);
-	          interruptibleTurns.delete(message.params.turnId);
-	          send({
-	            method: "turn/completed",
-	            params: {
-	              threadId: pending.threadId,
-	              turn: buildTurn(message.params.turnId, "interrupted")
-	            }
-	          });
+	        if (!pending) {
+	          const activeTurn = [...interruptibleTurns].find(([, entry]) => entry.threadId === message.params.threadId);
+	          if (activeTurn) {
+	            send({
+	              id: message.id,
+	              error: { code: -32600, message: "expected active turn id " + message.params.turnId + " but found " + activeTurn[0] }
+	            });
+	            break;
+	          }
+	          send({ id: message.id, result: {} });
+	          break;
 	        }
+	        clearTimeout(pending.timer);
+	        interruptibleTurns.delete(message.params.turnId);
+	        // Real Codex answers the interrupt before it reports the aborted turn.
 	        send({ id: message.id, result: {} });
+	        send({
+	          method: "turn/completed",
+	          params: {
+	            threadId: pending.threadId,
+	            turn: buildTurn(pending.completedTurnId || message.params.turnId, "interrupted")
+	          }
+	        });
 	        break;
 	      }
 

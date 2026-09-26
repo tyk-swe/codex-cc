@@ -6,13 +6,19 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
- * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
+ * @typedef {{ threadId: string, turnId: string }} SubagentTurn
+ * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null, subagentTurns?: SubagentTurn[] }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
  *   rootThreadId: string,
  *   threadIds: Set<string>,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
+ *   newlyRegisteredThreads: string[],
+ *   parkedNotifications: Array<{ threadId: string, message: AppServerNotification }>,
+ *   replayingParked: boolean,
+ *   trackDelegateTurn: boolean,
+ *   interruptTurnId: string | null,
  *   turnId: string | null,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
@@ -22,7 +28,7 @@
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
  *   pendingCollaborations: Set<string>,
- *   activeSubagentTurns: Set<string>,
+ *   activeSubagentTurns: Map<string, string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
  *   lastAgentMessage: string,
  *   lastAsyncMessage: string,
@@ -255,7 +261,11 @@ function registerThread(state, threadId, options = {}) {
     return;
   }
 
-  state.threadIds.add(threadId);
+  if (!state.threadIds.has(threadId)) {
+    state.threadIds.add(threadId);
+    // Lets captureTurn replay notifications that arrived before the thread was known.
+    state.newlyRegisteredThreads.push(threadId);
+  }
   const label =
     options.threadName ??
     options.name ??
@@ -266,6 +276,21 @@ function registerThread(state, threadId, options = {}) {
   if (label) {
     state.threadLabels.set(threadId, label);
   }
+}
+
+// Keyed by string so older protocol bindings (without the "completed" kind)
+// still typecheck.
+const SUBAGENT_ACTIVITY_MESSAGES = new Map([
+  ["started", (label) => `Started subagent ${label}.`],
+  ["interacted", (label) => `Messaged subagent ${label}.`],
+  ["interrupted", (label) => `Interrupted subagent ${label}.`],
+  ["completed", (label) => `Subagent ${label} completed.`]
+]);
+
+// "/root/design_challenger" -> "design_challenger"; nested paths keep their parents.
+function formatAgentPath(agentPath) {
+  const value = typeof agentPath === "string" ? agentPath.trim() : "";
+  return value.replace(/^\/root\//, "") || value || null;
 }
 
 function describeStartedItem(state, item) {
@@ -285,6 +310,9 @@ function describeStartedItem(state, item) {
       return { message: `Running tool: ${item.tool}.`, phase: "investigating" };
     case "collabAgentToolCall": {
       const subagents = (item.receiverThreadIds ?? []).map((threadId) => labelForThread(state, threadId) ?? threadId);
+      if (subagents.length === 0 && item.tool === "wait") {
+        return { message: "Waiting for subagents.", phase: "investigating" };
+      }
       const summary =
         subagents.length > 0
           ? `Starting subagent ${subagents.join(", ")} via collaboration tool: ${item.tool}.`
@@ -324,6 +352,12 @@ function describeCompletedItem(state, item) {
     }
     case "exitedReviewMode":
       return { message: "Reviewer finished.", phase: "finalizing" };
+    case "subAgentActivity": {
+      // Only described on completion: Codex emits started/completed back to back.
+      const describe = SUBAGENT_ACTIVITY_MESSAGES.get(String(item.kind));
+      const label = labelForThread(state, item.agentThreadId) ?? formatAgentPath(item.agentPath) ?? item.agentThreadId;
+      return describe ? { message: describe(label), phase: item.kind === "started" ? "investigating" : null } : null;
+    }
     default:
       return null;
   }
@@ -344,6 +378,11 @@ function createTurnCaptureState(threadId, options = {}) {
     threadIds: new Set([threadId]),
     threadTurnIds: new Map(),
     threadLabels: new Map(),
+    newlyRegisteredThreads: [],
+    parkedNotifications: [],
+    replayingParked: false,
+    trackDelegateTurn: Boolean(options.trackDelegateTurn),
+    interruptTurnId: null,
     turnId: null,
     bufferedNotifications: [],
     completion,
@@ -353,7 +392,7 @@ function createTurnCaptureState(threadId, options = {}) {
     completed: false,
     finalAnswerSeen: false,
     pendingCollaborations: new Set(),
-    activeSubagentTurns: new Set(),
+    activeSubagentTurns: new Map(),
     completionTimer: null,
     lastAgentMessage: "",
     lastAsyncMessage: "",
@@ -438,6 +477,13 @@ function belongsToTurn(state, message) {
 }
 
 function recordItem(state, item, lifecycle, threadId = null) {
+  if (item.type === "subAgentActivity") {
+    // Multi-agent v2 (all GPT-6 models) announces subagent threads only
+    // through these items: no thread/started, no collab receiverThreadIds.
+    registerThread(state, item.agentThreadId, { name: formatAgentPath(item.agentPath) });
+    return;
+  }
+
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
@@ -559,10 +605,12 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
-        state.activeSubagentTurns.add(message.params.threadId);
+        state.activeSubagentTurns.set(message.params.threadId, message.params.turn.id);
         emitProgress(
           state.onProgress,
-          `Subagent ${labelForThread(state, message.params.threadId)} turn started (${message.params.turn.id}).`
+          `Subagent ${labelForThread(state, message.params.threadId)} turn started (${message.params.turn.id}).`,
+          null,
+          { subagentTurns: snapshotSubagentTurns(state) }
         );
         break;
       }
@@ -614,6 +662,14 @@ function applyTurnNotification(state, message) {
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
+        // A subagent can run follow-up turns; accept its next turn id.
+        state.threadTurnIds.delete(message.params.threadId);
+        emitProgress(
+          state.onProgress,
+          `Subagent ${labelForThread(state, message.params.threadId)} turn ${message.params.turn?.status ?? "completed"}.`,
+          null,
+          { subagentTurns: snapshotSubagentTurns(state) }
+        );
         scheduleInferredCompletion(state);
         break;
       }
@@ -629,29 +685,132 @@ function applyTurnNotification(state, message) {
   }
 }
 
+/** @returns {SubagentTurn[]} */
+function snapshotSubagentTurns(state) {
+  return [...state.activeSubagentTurns].map(([threadId, turnId]) => ({ threadId, turnId }));
+}
+
+// Notifications for threads we do not know yet may belong to a subagent whose
+// subAgentActivity item has not arrived: Codex does not order them.
+const PARKABLE_METHODS = new Set(["turn/started", "turn/completed", "item/started", "item/completed", "error", "warning"]);
+const MAX_PARKED_NOTIFICATIONS = 500;
+
+function parkNotification(state, threadId, message) {
+  state.parkedNotifications.push({ threadId, message });
+  if (state.parkedNotifications.length > MAX_PARKED_NOTIFICATIONS) {
+    state.parkedNotifications.shift();
+  }
+}
+
+function replayParkedNotifications(state, dispatch) {
+  if (state.replayingParked) {
+    return;
+  }
+  state.replayingParked = true;
+  try {
+    // Replaying can register further threads (grandchildren); keep going.
+    while (state.newlyRegisteredThreads.length > 0) {
+      const threadId = state.newlyRegisteredThreads.shift();
+      const ready = [];
+      state.parkedNotifications = state.parkedNotifications.filter((entry) => {
+        if (entry.threadId !== threadId) {
+          return true;
+        }
+        ready.push(entry.message);
+        return false;
+      });
+      for (const message of ready) {
+        dispatch(message);
+      }
+    }
+  } finally {
+    state.replayingParked = false;
+  }
+}
+
+// An inline review runs in a delegate turn: turn/started carries the
+// delegate's id, which is the only id turn/interrupt accepts, while items and
+// turn/completed carry the review/start response id.
+function isReviewDelegateTurnStart(state, message) {
+  return (
+    state.trackDelegateTurn &&
+    message.method === "turn/started" &&
+    message.params?.threadId === state.threadId &&
+    Boolean(state.turnId) &&
+    Boolean(message.params?.turn?.id) &&
+    message.params.turn.id !== state.turnId
+  );
+}
+
+/**
+ * GPT-6 subagents can still be running when the root turn completes; nothing
+ * would read their results. Interrupt them so no Codex work keeps changing the
+ * workspace after the run reports completion.
+ */
+async function stopLeftoverSubagents(client, state) {
+  if (state.activeSubagentTurns.size === 0) {
+    return;
+  }
+  const stopped = [];
+  for (const [threadId, turnId] of [...state.activeSubagentTurns]) {
+    const outcome = await requestQuietly(client, "turn/interrupt", { threadId, turnId });
+    if (outcome.ok) {
+      // Codex answers before it sends turn/completed, which may never reach us.
+      state.activeSubagentTurns.delete(threadId);
+      stopped.push(labelForThread(state, threadId) ?? threadId);
+    }
+  }
+  if (stopped.length > 0) {
+    emitProgress(
+      state.onProgress,
+      `Interrupted ${stopped.length} subagent(s) still running when Codex finished: ${stopped.join(", ")}.`,
+      null,
+      { subagentTurns: [] }
+    );
+  }
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+
+  const dispatch = (message) => {
+    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      applyTurnNotification(state, message);
+      replayParkedNotifications(state, dispatch);
+      return;
+    }
+
+    if (isReviewDelegateTurnStart(state, message)) {
+      state.interruptTurnId = message.params.turn.id;
+      emitProgress(state.onProgress, `Turn started (${state.interruptTurnId}).`, "starting", {
+        threadId: state.threadId,
+        turnId: state.interruptTurnId
+      });
+      return;
+    }
+
+    const messageThreadId = extractThreadId(message);
+    if (messageThreadId && !state.threadIds.has(messageThreadId) && PARKABLE_METHODS.has(message.method)) {
+      parkNotification(state, messageThreadId, message);
+      return;
+    }
+
+    if (!belongsToTurn(state, message)) {
+      previousHandler?.(message);
+      return;
+    }
+
+    applyTurnNotification(state, message);
+    replayParkedNotifications(state, dispatch);
+  };
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
     }
-
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
+    dispatch(message);
   });
 
   try {
@@ -661,22 +820,17 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
-    for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
+    for (const message of state.bufferedNotifications.splice(0)) {
+      dispatch(message);
     }
-    state.bufferedNotifications.length = 0;
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
     }
 
-    return await waitForTurnOrExit(client, state);
+    await waitForTurnOrExit(client, state);
+    await stopLeftoverSubagents(client, state);
+    return state;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
@@ -1149,6 +1303,67 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
+const INTERRUPT_TIMEOUT_MS = 5000;
+
+/**
+ * Interrupts several turns over one connection, in order. `turn/interrupt`
+ * only answers once the turn has aborted, so every call is bounded.
+ */
+export async function interruptAppServerTurns(cwd, targets) {
+  const turns = (Array.isArray(targets) ? targets : []).filter((target) => target?.threadId && target?.turnId);
+  if (turns.length === 0) {
+    return [];
+  }
+
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    return turns.map(({ threadId, turnId }) => ({
+      threadId,
+      turnId,
+      attempted: false,
+      interrupted: false,
+      transport: null,
+      detail: availability.detail
+    }));
+  }
+
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+  } catch (error) {
+    return turns.map(({ threadId, turnId }) => ({
+      threadId,
+      turnId,
+      attempted: true,
+      interrupted: false,
+      transport: null,
+      detail: error instanceof Error ? error.message : String(error)
+    }));
+  }
+
+  const results = [];
+  try {
+    for (const { threadId, turnId } of turns) {
+      const outcome = await requestQuietly(client, "turn/interrupt", { threadId, turnId }, INTERRUPT_TIMEOUT_MS);
+      results.push({
+        threadId,
+        turnId,
+        attempted: true,
+        interrupted: outcome.ok,
+        transport: client.transport,
+        detail: outcome.ok
+          ? `Interrupted ${turnId} on ${threadId}.`
+          : outcome.error instanceof Error
+            ? outcome.error.message
+            : String(outcome.error)
+      });
+    }
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return results;
+}
+
 export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   if (!threadId || !turnId) {
     return {
@@ -1158,37 +1373,13 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
       detail: "missing threadId or turnId"
     };
   }
-
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
-  }
-
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
-  } catch (error) {
-    return {
-      attempted: true,
-      interrupted: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await client?.close().catch(() => {});
-  }
+  const [result] = await interruptAppServerTurns(cwd, [{ threadId, turnId }]);
+  return {
+    attempted: result.attempted,
+    interrupted: result.interrupted,
+    transport: result.transport,
+    detail: result.detail
+  };
 }
 
 export async function runAppServerReview(cwd, options = {}) {
@@ -1225,6 +1416,7 @@ export async function runAppServerReview(cwd, options = {}) {
           }),
         {
           onProgress: options.onProgress,
+          trackDelegateTurn: true,
           onResponse(response, state) {
             if (response.reviewThreadId) {
               state.threadIds.add(response.reviewThreadId);

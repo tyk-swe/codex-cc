@@ -1148,6 +1148,113 @@ test("app-server connections opt out of streaming notifications the plugin never
   }
 });
 
+test("task logs GPT-6 subagent work, including events that arrive before the subagent is announced", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "with-v2-subagent");
+
+  const result = run("node", [SCRIPT, "task", "challenge the current design"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const log = readLatestJobLog(repo);
+  assert.match(log, /Started subagent design_challenger\./);
+  assert.match(log, /Subagent design_challenger: Early finding from the child\./);
+  assert.match(log, /Subagent design_challenger: Follow-up detail from the child\./);
+  assert.match(log, /Waiting for subagents\./);
+});
+
+test("task interrupts GPT-6 subagents that are still running when Codex finishes", () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "with-v2-subagent-still-running");
+
+  const result = run("node", [SCRIPT, "task", "challenge the current design"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const childThread = fakeState.threads.find((thread) => thread.ephemeral && !thread.name);
+  assert.deepEqual(
+    fakeState.interrupts.map((interrupt) => interrupt.threadId),
+    [childThread.id]
+  );
+  assert.match(readLatestJobLog(repo), /Interrupted 1 subagent\(s\) still running when Codex finished: design_challenger\./);
+});
+
+test("cancel interrupts running GPT-6 subagents before the root turn", async () => {
+  const repo = makeRepoWithCommit();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-task-with-subagent");
+  const env = buildEnv(binDir);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate with helpers"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${jobId}.json`);
+
+  const runningJob = await waitFor(() => {
+    if (!fs.existsSync(jobFile)) {
+      return null;
+    }
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.status === "running" && job.turnId && job.subagentTurns?.length === 1 ? job : null;
+  }, { timeoutMs: 15000 });
+
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  const cancelPayload = JSON.parse(cancelResult.stdout);
+  assert.equal(cancelPayload.turnInterrupted, true);
+  assert.deepEqual(cancelPayload.subagentInterrupts, [{ ...runningJob.subagentTurns[0], interrupted: true }]);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.interrupts.slice(0, 2), [
+    runningJob.subagentTurns[0],
+    { threadId: runningJob.threadId, turnId: runningJob.turnId }
+  ]);
+});
+
+test("cancel interrupts a running native review through its delegate turn and keeps it cancelled", async () => {
+  const repo = makeRepoWithCommit();
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-review");
+  const env = buildEnv(binDir);
+
+  const review = spawn(process.execPath, [SCRIPT, "review", "--json"], { cwd: repo, env, stdio: "ignore" });
+  const reviewExited = new Promise((resolve) => review.on("close", resolve));
+  try {
+    const runningJob = await waitFor(() => {
+      const stateFile = resolveStateFile(repo);
+      if (!fs.existsSync(stateFile)) {
+        return null;
+      }
+      const job = JSON.parse(fs.readFileSync(stateFile, "utf8")).jobs[0];
+      return job?.status === "running" && job.turnId ? job : null;
+    }, { timeoutMs: 15000 });
+    assert.match(runningJob.turnId, /_delegate$/);
+
+    const cancelResult = run("node", [SCRIPT, "cancel", runningJob.id, "--json"], { cwd: repo, env });
+
+    assert.equal(cancelResult.status, 0, cancelResult.stderr);
+    assert.equal(JSON.parse(cancelResult.stdout).turnInterrupted, true);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.deepEqual(fakeState.lastInterrupt, { threadId: runningJob.threadId, turnId: runningJob.turnId });
+
+    await Promise.race([
+      reviewExited,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("review process did not exit")), 10000))
+    ]);
+    const finalJob = JSON.parse(fs.readFileSync(resolveStateFile(repo), "utf8")).jobs.find((job) => job.id === runningJob.id);
+    assert.equal(finalJob.status, "cancelled");
+  } finally {
+    review.kill();
+  }
+});
+
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

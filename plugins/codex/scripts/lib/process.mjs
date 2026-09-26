@@ -101,7 +101,14 @@ export function terminateProcessTree(pid, options = {}) {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
-    if (error?.code !== "ESRCH") {
+    // ESRCH on the group means the pid is not a group leader (for example a
+    // foreground command run by Claude's shell) or is gone. Only signal it
+    // directly when it verifiably still runs the expected command, so a
+    // recycled pid is never hit.
+    const signalProcess =
+      error?.code !== "ESRCH" ||
+      (options.expectedCommand instanceof RegExp && processCommandMatches(pid, options.expectedCommand, runCommandImpl));
+    if (signalProcess) {
       try {
         killImpl(pid, "SIGTERM");
         return { attempted: true, delivered: true, method: "process" };
@@ -115,6 +122,11 @@ export function terminateProcessTree(pid, options = {}) {
 
     return { attempted: true, delivered: false, method: "process-group" };
   }
+}
+
+function processCommandMatches(pid, pattern, runCommandImpl) {
+  const result = runCommandImpl("ps", ["-o", "command=", "-p", String(pid)], { shell: false });
+  return !result.error && result.status === 0 && pattern.test(result.stdout);
 }
 
 export function formatCommandFailure(result) {

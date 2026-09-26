@@ -9,6 +9,19 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+const MAX_TRACKED_SUBAGENT_TURNS = 32;
+
+// Active subagent turns reported by the runtime, so /codex:cancel can reach them.
+function normalizeSubagentTurns(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value
+    .filter((entry) => typeof entry?.threadId === "string" && entry.threadId && typeof entry?.turnId === "string" && entry.turnId)
+    .slice(0, MAX_TRACKED_SUBAGENT_TURNS)
+    .map((entry) => ({ threadId: entry.threadId, turnId: entry.turnId }));
+}
+
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return {
@@ -18,7 +31,8 @@ function normalizeProgressEvent(value) {
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      subagentTurns: normalizeSubagentTurns(value.subagentTurns)
     };
   }
 
@@ -29,7 +43,8 @@ function normalizeProgressEvent(value) {
     turnId: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
-    logBody: null
+    logBody: null,
+    subagentTurns: null
   };
 }
 
@@ -71,11 +86,22 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastSubagentTurnsKey = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
+    // Only the job file needs this; keep state.json small.
+    let jobFilePatch = null;
+
+    if (normalized.subagentTurns) {
+      const key = JSON.stringify(normalized.subagentTurns);
+      if (key !== lastSubagentTurnsKey) {
+        lastSubagentTurnsKey = key;
+        jobFilePatch = { subagentTurns: normalized.subagentTurns };
+      }
+    }
 
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;
@@ -95,11 +121,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
-    if (!changed) {
+    if (!changed && !jobFilePatch) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    if (changed) {
+      upsertJob(workspaceRoot, patch);
+    }
 
     const jobFile = resolveJobFile(workspaceRoot, jobId);
     if (!fs.existsSync(jobFile)) {
@@ -109,7 +137,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     const storedJob = readJobFile(jobFile);
     writeJobFile(workspaceRoot, jobId, {
       ...storedJob,
-      ...patch
+      ...patch,
+      ...(jobFilePatch ?? {})
     });
   };
 }
@@ -153,6 +182,11 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
+    if (readStoredJobOrNull(job.workspaceRoot, job.id)?.status === "cancelled") {
+      // /codex:cancel already finalized this job; the interrupted run ending
+      // afterwards must not relabel it as failed.
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -181,6 +215,9 @@ export async function runTrackedJob(job, runner, options = {}) {
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    if (existing.status === "cancelled") {
+      throw error;
+    }
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
