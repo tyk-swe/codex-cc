@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, listCreatedTempDirs, makeTempDir, run } from "./helpers.mjs";
@@ -1382,6 +1382,38 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+});
+
+test("a background task survives delayed job persistence without remaining queued", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+  const bootstrap = `
+    import fs from "node:fs";
+    const write = fs.writeFileSync;
+    let delayed = false;
+    fs.writeFileSync = (file, contents, ...args) => {
+      if (!delayed && String(file).endsWith(".tmp") && String(contents).includes('"status": "queued"')) {
+        delayed = true;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 750);
+      }
+      return write(file, contents, ...args);
+    };
+    process.argv = [process.execPath, ${JSON.stringify(SCRIPT)}, "task", "--background", "--json", "check startup"];
+    await import(${JSON.stringify(pathToFileURL(SCRIPT).href)});
+  `;
+  const launched = run(process.execPath, ["--input-type=module", "-e", bootstrap], { cwd: repo, env, timeout: 10000 });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run(process.execPath, [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "10000", "--json"], {
+    cwd: repo, env, timeout: 15000
+  });
+  assert.equal(waited.status, 0, waited.stderr);
+  const snapshot = JSON.parse(waited.stdout);
+  assert.equal(snapshot.waitTimedOut, false);
+  assert.equal(snapshot.job.status, "completed");
+  assert.equal(snapshot.job.pid, null);
 });
 
 test("review rejects focus text because it is native-review only", () => {

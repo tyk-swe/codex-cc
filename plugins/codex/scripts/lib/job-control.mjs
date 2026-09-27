@@ -189,18 +189,17 @@ export function readStoredJob(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
-function matchJobReference(jobs, reference, predicate = () => true) {
-  const filtered = jobs.filter(predicate);
+function matchJobReference(jobs, reference) {
   if (!reference) {
-    return filtered[0] ?? null;
+    return jobs[0] ?? null;
   }
 
-  const exact = filtered.find((job) => job.id === reference);
+  const exact = jobs.find((job) => job.id === reference);
   if (exact) {
     return exact;
   }
 
-  const prefixMatches = filtered.filter((job) => job.id.startsWith(reference));
+  const prefixMatches = jobs.filter((job) => job.id.startsWith(reference));
   if (prefixMatches.length === 1) {
     return prefixMatches[0];
   }
@@ -257,9 +256,9 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
-  const selected = matchJobReference(
-    jobs,
-    reference,
+  // Explicit IDs and prefixes identify jobs regardless of their current status.
+  const candidates = reference ? [matchJobReference(jobs, reference)] : jobs;
+  const selected = candidates.find(
     (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
   );
 
@@ -267,7 +266,7 @@ export function resolveResultJob(cwd, reference) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = candidates.find((job) => job.status === "queued" || job.status === "running");
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
   }

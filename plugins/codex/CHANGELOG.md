@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Inline option values retain embedded `=` characters, and quoted raw arguments preserve literal backslashes and empty values.
+- `/codex:result` reports when an explicitly selected job is still queued or running, and resolves ambiguous prefixes across all job statuses.
+- Background workers wait until their job record and PID are saved before starting. Failed launches clean up the worker and report the error instead of leaving a job queued indefinitely.
+
+### Changed
+
+- Pull request CI checks that release manifest versions agree.
+
 ## 1.1.0
 
 First release of the community-maintained fork at [tyk-swe/codex-cc](https://github.com/tyk-swe/codex-cc), updated for Codex CLI 0.157 and the GPT-6 models. Install it with `/plugin marketplace add tyk-swe/codex-cc`; the plugin ID `codex@openai-codex` and the `/codex:*` commands are unchanged.

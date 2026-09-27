@@ -25,6 +25,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check version metadata
+        run: npm run check-version
+
       # Pinned so pull request results are reproducible. Keep it at or above
       # TESTED_CODEX_VERSION in plugins/codex/scripts/lib/codex.mjs; the weekly
       # Codex compatibility workflow covers the latest release.

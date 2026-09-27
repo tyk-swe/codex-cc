@@ -25,7 +25,9 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      const equalsIndex = token.indexOf("=");
+      const rawKey = token.slice(2, equalsIndex === -1 ? undefined : equalsIndex);
+      const inlineValue = equalsIndex === -1 ? undefined : token.slice(equalsIndex + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -78,15 +80,24 @@ export function splitRawArgumentString(raw) {
   let current = "";
   let quote = null;
   let escaping = false;
+  let tokenStarted = false;
 
   for (const character of raw) {
     if (escaping) {
-      current += character;
+      // Within double quotes, backslashes only escape shell-special characters.
+      // Single quotes preserve every backslash literally.
+      if (quote === '"' && !['"', "\\", "$", "`", "\n"].includes(character)) {
+        current += "\\";
+      }
+      if (character !== "\n") {
+        current += character;
+        tokenStarted = true;
+      }
       escaping = false;
       continue;
     }
 
-    if (character === "\\") {
+    if (character === "\\" && quote !== "'") {
       escaping = true;
       continue;
     }
@@ -102,25 +113,29 @@ export function splitRawArgumentString(raw) {
 
     if (character === "'" || character === "\"") {
       quote = character;
+      tokenStarted = true;
       continue;
     }
 
     if (/\s/.test(character)) {
-      if (current) {
+      if (tokenStarted) {
         tokens.push(current);
         current = "";
+        tokenStarted = false;
       }
       continue;
     }
 
     current += character;
+    tokenStarted = true;
   }
 
   if (escaping) {
     current += "\\";
+    tokenStarted = true;
   }
 
-  if (current) {
+  if (tokenStarted) {
     tokens.push(current);
   }
 

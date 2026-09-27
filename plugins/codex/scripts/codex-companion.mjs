@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -8,23 +7,23 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
-    buildPersistentTaskThreadName,
-    DEFAULT_CONTINUE_PROMPT,
-    findLatestTaskThread,
-    getCodexAuthStatus,
-    getCodexAvailability,
-    getSessionRuntimeStatus,
-    importExternalAgentSession,
-    isCodexVersionBelow,
-    parseCodexVersion,
-    TESTED_CODEX_VERSION,
-    interruptAppServerTurns,
-    parseStructuredOutput,
-    readOutputSchema,
-    releaseBrokerThreads,
-    runAppServerReview,
-    runAppServerTurn
-  } from "./lib/codex.mjs";
+  buildPersistentTaskThreadName,
+  DEFAULT_CONTINUE_PROMPT,
+  findLatestTaskThread,
+  getCodexAuthStatus,
+  getCodexAvailability,
+  getSessionRuntimeStatus,
+  importExternalAgentSession,
+  isCodexVersionBelow,
+  parseCodexVersion,
+  TESTED_CODEX_VERSION,
+  interruptAppServerTurns,
+  parseStructuredOutput,
+  readOutputSchema,
+  releaseBrokerThreads,
+  runAppServerReview,
+  runAppServerTurn
+} from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -57,6 +56,7 @@ import {
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { launchTaskWorker, waitForTaskWorkerStart } from "./lib/task-worker.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -677,34 +677,57 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
-function spawnDetachedTaskWorker(cwd, jobId) {
-  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
-    cwd,
-    env: process.env,
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
-  return child;
-}
-
-function enqueueBackgroundTask(cwd, job, request) {
+async function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  try {
+    await launchTaskWorker(cwd, job.id, (pid) => {
+      queuedRecord.pid = pid;
+      writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+      upsertJob(job.workspaceRoot, queuedRecord);
+    });
+  } catch (error) {
+    const failedRecord = {
+      ...queuedRecord,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt: nowIso(),
+      errorMessage: `Could not start background task: ${error instanceof Error ? error.message : String(error)}`
+    };
+    let cancelled = false;
+    try {
+      cancelled =
+        readStoredJob(job.workspaceRoot, job.id)?.status === "cancelled" ||
+        listJobs(job.workspaceRoot).some((entry) => entry.id === job.id && entry.status === "cancelled");
+    } catch {
+      // The state store may be the reason startup failed.
+    }
+    if (!cancelled) {
+      // One store may still be writable after a persistence failure. Try both,
+      // but preserve the original launch error if recording it also fails.
+      for (const save of [
+        () => writeJobFile(job.workspaceRoot, job.id, failedRecord),
+        () => upsertJob(job.workspaceRoot, failedRecord)
+      ]) {
+        try {
+          save();
+        } catch {
+          // The command still reports the launch failure to its caller.
+        }
+      }
+    }
+    throw new Error(failedRecord.errorMessage, { cause: error });
+  }
 
   return {
     payload: {
@@ -808,7 +831,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = await enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -846,18 +869,23 @@ async function handleTransfer(argv) {
 
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
+    valueOptions: ["cwd", "job-id"],
+    booleanOptions: ["wait-for-start"]
   });
 
   if (!options["job-id"]) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
+  const startAllowed = !options["wait-for-start"] || (await waitForTaskWorkerStart());
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status === "cancelled") {
+    return;
   }
 
   const request = storedJob.request;
@@ -880,11 +908,15 @@ async function handleTaskWorker(argv) {
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
+    () => {
+      if (!startAllowed) {
+        throw new Error("Background task launch was aborted before startup.");
+      }
+      return executeTaskRun({
         ...request,
         onProgress: progress
-      }),
+      });
+    },
     { logFile }
   );
 }
