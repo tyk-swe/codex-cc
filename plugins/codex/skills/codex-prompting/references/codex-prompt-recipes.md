@@ -1,6 +1,6 @@
 # Codex Prompt Recipes
 
-Use these as starting templates for Codex task prompts or other Codex/GPT-5.4 prompt construction.
+Use these as starting templates for Codex task prompts.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
 In `codex:codex-rescue`, run diagnosis and fix-oriented recipes in write mode by default unless the user explicitly asked for read-only behavior.
 
@@ -9,7 +9,7 @@ In `codex:codex-rescue`, run diagnosis and fix-oriented recipes in write mode by
 ```xml
 <task>
 Diagnose why the failing test or command is breaking in this repository.
-Use the available repository context and tools to identify the most likely root cause.
+Identify the most likely root cause from the available repository context and tools.
 </task>
 
 <compact_output_contract>
@@ -18,15 +18,6 @@ Return a compact diagnosis with:
 2. evidence
 3. smallest safe next step
 </compact_output_contract>
-
-<default_follow_through_policy>
-Keep going until you have enough evidence to identify the root cause confidently.
-Only stop to ask questions when a missing detail changes correctness materially.
-</default_follow_through_policy>
-
-<verification_loop>
-Before finalizing, verify that the proposed root cause matches the observed evidence.
-</verification_loop>
 
 <missing_context_gating>
 Do not guess missing repository facts.
@@ -39,6 +30,7 @@ If required context is absent, state exactly what remains unknown.
 ```xml
 <task>
 Implement the smallest safe fix for the identified issue in this repository.
+Apply the fix; do not stop at the diagnosis.
 Preserve existing behavior outside the failing path.
 </task>
 
@@ -53,15 +45,6 @@ Return:
 <default_follow_through_policy>
 Default to the most reasonable low-risk interpretation and keep going.
 </default_follow_through_policy>
-
-<completeness_contract>
-Resolve the task fully before stopping.
-Do not stop after identifying the issue without applying the fix.
-</completeness_contract>
-
-<verification_loop>
-Before finalizing, verify that the fix matches the task requirements and that the changed code is coherent.
-</verification_loop>
 
 <action_safety>
 Keep changes tightly scoped to the stated task.
@@ -88,15 +71,9 @@ Return:
 Ground every claim in the repository context or tool outputs.
 If a point is an inference, label it clearly.
 </grounding_rules>
-
-<dig_deeper_nudge>
-Check for second-order failures, empty-state handling, retries, stale state, and rollback paths before finalizing.
-</dig_deeper_nudge>
-
-<verification_loop>
-Before finalizing, verify that each finding is material and actionable.
-</verification_loop>
 ```
+
+Add `dig_deeper_nudge` only when the user asked for an especially thorough pass.
 
 ## Research Or Recommendation
 
@@ -115,7 +92,7 @@ Return:
 
 <research_mode>
 Separate observed facts, reasoned inferences, and open questions.
-Prefer breadth first, then go deeper only where the evidence changes the recommendation.
+Go deeper only where the evidence changes the recommendation.
 </research_mode>
 
 <citation_rules>
@@ -128,7 +105,7 @@ Prefer primary sources.
 
 ```xml
 <task>
-Diagnose why this existing prompt is underperforming and propose the smallest high-leverage changes to improve it for Codex or GPT-5.4.
+Diagnose why this existing prompt is underperforming with current Codex models and propose the smallest high-leverage changes to improve it.
 </task>
 
 <structured_output_contract>
@@ -143,8 +120,4 @@ Return:
 Base your diagnosis on the prompt text and the failure examples provided.
 Do not invent failure modes that are not supported by the examples.
 </grounding_rules>
-
-<verification_loop>
-Before finalizing, make sure the revised prompt resolves the cited failure modes without adding contradictory instructions.
-</verification_loop>
 ```

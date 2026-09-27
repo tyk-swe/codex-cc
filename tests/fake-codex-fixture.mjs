@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { writeExecutable } from "./helpers.mjs";
+import { stripInheritedEnv, writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -39,19 +39,25 @@ function now() {
   return Math.floor(Date.now() / 1000);
 }
 
+// Real \`codex app-server\` records every thread it creates with the "vscode"
+// session source, and \`thread/list\` defaults to the interactive sources.
+const THREAD_SOURCE = "vscode";
+const DEFAULT_LIST_SOURCE_KINDS = ["cli", "vscode"];
+const DEFAULT_MODEL_PROVIDER = "openai";
+
 function buildThread(thread) {
   return {
     id: thread.id,
     preview: thread.preview || "",
     ephemeral: Boolean(thread.ephemeral),
-    modelProvider: "openai",
+    modelProvider: thread.modelProvider || DEFAULT_MODEL_PROVIDER,
     createdAt: thread.createdAt,
     updatedAt: thread.updatedAt,
     status: { type: "idle" },
     path: null,
     cwd: thread.cwd,
     cliVersion: "fake-codex",
-    source: "appServer",
+    source: THREAD_SOURCE,
     agentNickname: null,
     agentRole: null,
     gitInfo: null,
@@ -160,9 +166,10 @@ function saveImportLedger(ledger) {
   fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
 }
 
-function emitTurnCompleted(threadId, turnId, item) {
+function emitTurnCompleted(threadId, turnId, item, options = {}) {
   const items = Array.isArray(item) ? item : [item];
-  send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
+  // Real inline reviews announce the review delegate's turn id in turn/started.
+  send({ method: "turn/started", params: { threadId, turn: buildTurn(options.startedTurnId || turnId) } });
   for (const entry of items) {
     if (entry && entry.started) {
       send({ method: "item/started", params: { threadId, turnId, item: entry.started } });
@@ -249,7 +256,7 @@ function taskPayload(prompt, resume) {
 
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
-  console.log("codex-cli test");
+  console.log(BEHAVIOR === "old-cli" ? "codex-cli 0.142.5" : "codex-cli test");
   process.exit(0);
 }
 if (args[0] === "app-server" && args[1] === "--help") {
@@ -313,7 +320,7 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6-astra", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -328,12 +335,29 @@ rl.on("line", (line) => {
       }
 
       case "thread/list": {
+        state.lastThreadList = message.params;
+        saveState(state);
         let threads = state.threads.slice();
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);
         }
+        const sourceKinds =
+          Array.isArray(message.params.sourceKinds) && message.params.sourceKinds.length > 0
+            ? message.params.sourceKinds
+            : DEFAULT_LIST_SOURCE_KINDS;
+        if (!sourceKinds.includes(THREAD_SOURCE)) {
+          threads = [];
+        }
+        const modelProviders = message.params.modelProviders;
+        if (modelProviders == null) {
+          threads = threads.filter((thread) => (thread.modelProvider || DEFAULT_MODEL_PROVIDER) === DEFAULT_MODEL_PROVIDER);
+        } else if (modelProviders.length > 0) {
+          threads = threads.filter((thread) => modelProviders.includes(thread.modelProvider || DEFAULT_MODEL_PROVIDER));
+        }
         if (message.params.searchTerm) {
-          threads = threads.filter((thread) => (thread.name || "").includes(message.params.searchTerm));
+          threads = threads.filter((thread) =>
+            (thread.name || "").includes(message.params.searchTerm) || (thread.preview || "").includes(message.params.searchTerm)
+          );
         }
         threads.sort((left, right) => right.updatedAt - left.updatedAt);
         send({ id: message.id, result: { data: threads.map(buildThread), nextCursor: null } });
@@ -344,10 +368,31 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
+        if (BEHAVIOR === "legacy-resume" && requiresExperimental("excludeTurns", message, state)) {
+          send({ id: message.id, error: { code: -32600, message: "thread/resume.excludeTurns requires experimentalApi capability" } });
+          break;
+        }
+        state.resumeCalls = [...(state.resumeCalls || []), message.params];
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        if (message.params.excludeTurns !== true && BEHAVIOR !== "legacy-resume") {
+          send({
+            method: "deprecationNotice",
+            params: {
+              summary: "Full-history hydration is deprecated for paginated threads; use \`excludeTurns: true\`, then page with \`thread/turns/list\` and \`thread/items/list\`.",
+              details: null
+            }
+          });
+        }
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6-astra", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        break;
+      }
+
+      case "thread/unsubscribe": {
+        state.unsubscribed = [...(state.unsubscribed || []), message.params.threadId];
+        saveState(state);
+        send({ id: message.id, result: { status: "unsubscribed" } });
         break;
       }
 
@@ -368,9 +413,41 @@ rl.on("line", (line) => {
           throw new Error("missing external session migration");
         }
         const sourcePath = fs.realpathSync(session.path);
+        const importId = "import_" + crypto.randomUUID();
+        if (BEHAVIOR === "external-import-failure") {
+          // Codex can finish (and fail) the import before answering the request.
+          send({
+            method: "externalAgentConfig/import/completed",
+            params: {
+              importId,
+              itemTypeResults: [
+                {
+                  itemType: "SESSIONS",
+                  successes: [],
+                  failures: [
+                    {
+                      itemType: "SESSIONS",
+                      errorType: null,
+                      subErrorType: null,
+                      failureStage: "session_missing",
+                      message: "external agent session was not detected for import: " + sourcePath,
+                      cwd: null,
+                      source: sourcePath
+                    }
+                  ]
+                }
+              ]
+            }
+          });
+          send({ id: message.id, result: { importId } });
+          break;
+        }
+        // Older CLIs only recorded the imported thread in a ledger file and
+        // completed without results; current CLIs report it in the completion.
+        const legacyImport = BEHAVIOR === "external-import-legacy";
         const contents = fs.readFileSync(sourcePath, "utf8");
         const contentSha256 = crypto.createHash("sha256").update(contents).digest("hex");
-        const ledger = loadImportLedger();
+        const ledger = legacyImport ? loadImportLedger() : { records: state.importRecords || [] };
         let record = ledger.records.find(
           (candidate) => candidate.source_path === sourcePath && candidate.content_sha256 === contentSha256
         );
@@ -396,11 +473,36 @@ rl.on("line", (line) => {
             source_modified_at: null
           };
           ledger.records.push(record);
+          if (legacyImport) {
+            saveImportLedger(ledger);
+          } else {
+            state.importRecords = ledger.records;
+          }
           saveState(state);
-          saveImportLedger(ledger);
         }
-        send({ id: message.id, result: {} });
-        send({ method: "externalAgentConfig/import/completed", params: {} });
+        if (legacyImport) {
+          send({ id: message.id, result: {} });
+          send({ method: "externalAgentConfig/import/completed", params: {} });
+          break;
+        }
+        send({
+          method: "externalAgentConfig/import/progress",
+          params: { importId, itemTypeResults: [{ itemType: "SESSIONS", successes: [], failures: [] }] }
+        });
+        send({ id: message.id, result: { importId } });
+        send({
+          method: "externalAgentConfig/import/completed",
+          params: {
+            importId,
+            itemTypeResults: [
+              {
+                itemType: "SESSIONS",
+                successes: [{ itemType: "SESSIONS", cwd: session.cwd, source: sourcePath, target: thread.id, title: thread.name }],
+                failures: []
+              }
+            ]
+          }
+        });
         break;
       }
 
@@ -412,7 +514,22 @@ rl.on("line", (line) => {
           send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
         }
         const turnId = nextTurnId(state);
+        const delegateTurnId = turnId + "_delegate";
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
+        if (BEHAVIOR === "interruptible-slow-review") {
+          send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(delegateTurnId) } });
+          send({
+            method: "item/started",
+            params: { threadId: reviewThread.id, turnId, item: { type: "enteredReviewMode", id: turnId, review: "current changes" } }
+          });
+          const timer = setTimeout(() => {
+            interruptibleTurns.delete(delegateTurnId);
+            send({ method: "turn/completed", params: { threadId: reviewThread.id, turn: buildTurn(turnId, "completed") } });
+          }, 8000);
+          // Like real Codex, only the delegate's turn id is interruptible.
+          interruptibleTurns.set(delegateTurnId, { threadId: reviewThread.id, timer, completedTurnId: turnId });
+          break;
+        }
         emitTurnCompleted(reviewThread.id, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
@@ -432,7 +549,7 @@ rl.on("line", (line) => {
           {
             completed: { type: "exitedReviewMode", id: turnId, review: nativeReviewText(message.params.target) }
           }
-        ]);
+        ], { startedTurnId: delegateTurnId });
         break;
       }
 
@@ -457,11 +574,138 @@ rl.on("line", (line) => {
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+        const finalAnswer = { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" };
+
+        if (BEHAVIOR === "crash-mid-turn") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          process.stderr.write("fatal: simulated app-server crash\\n");
+          setTimeout(() => process.exit(3), 20);
+          break;
+        }
+
+        if (BEHAVIOR === "retrying-task") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          for (const attempt of [1, 2]) {
+            send({
+              method: "error",
+              params: {
+                threadId: thread.id,
+                turnId,
+                willRetry: true,
+                error: { message: "Reconnecting... " + attempt + "/5", codexErrorInfo: null, additionalDetails: null }
+              }
+            });
+          }
+          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          break;
+        }
+
+        if (BEHAVIOR === "async-final-message") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({
+            method: "item/completed",
+            params: {
+              threadId: thread.id,
+              turnId,
+              item: { type: "agentMessage", id: "async_" + turnId, text: "Still working; I will report back shortly.", phase: "final_answer", delivery: "async" }
+            }
+          });
+          setTimeout(() => {
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 600);
+          break;
+        }
+
+        if (BEHAVIOR === "deprecation-on-turn") {
+          send({ method: "deprecationNotice", params: { summary: "The fake feature is deprecated.", details: "Use the replacement instead." } });
+        }
+
+        // Multi-agent v2 (GPT-6): subagents are announced only by subAgentActivity
+        // items on the parent thread; there is no thread/started for them.
+        if (
+          BEHAVIOR === "with-v2-subagent" ||
+          BEHAVIOR === "with-v2-subagent-still-running" ||
+          BEHAVIOR === "interruptible-slow-task-with-subagent"
+        ) {
+          const childThread = nextThread(state, thread.cwd, true);
+          const childTurnId = nextTurnId(state);
+          const agentPath = "/root/design_challenger";
+          const activity = (kind) => ({ type: "subAgentActivity", id: "activity_" + kind + "_" + childTurnId, kind, agentThreadId: childThread.id, agentPath });
+          const childMessage = (id, text) => ({ type: "agentMessage", id, text, phase: null });
+          const announceChild = () => {
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: activity("started") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: activity("started") } });
+          };
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+
+          if (BEHAVIOR === "with-v2-subagent") {
+            // The child's first events race ahead of the parent's subAgentActivity item.
+            send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(childTurnId) } });
+            send({
+              method: "item/completed",
+              params: { threadId: childThread.id, turnId: childTurnId, item: childMessage("msg_" + childTurnId, "Early finding from the child.") }
+            });
+            announceChild();
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(childTurnId, "completed") } });
+            // A follow-up task runs a second turn on the same child thread.
+            const followUpTurnId = nextTurnId(state);
+            send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(followUpTurnId) } });
+            send({
+              method: "item/completed",
+              params: { threadId: childThread.id, turnId: followUpTurnId, item: childMessage("msg_" + followUpTurnId, "Follow-up detail from the child.") }
+            });
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(followUpTurnId, "completed") } });
+            const waitItem = (status) => ({
+              type: "collabAgentToolCall",
+              id: "wait_" + turnId,
+              tool: "wait",
+              status,
+              senderThreadId: thread.id,
+              receiverThreadIds: [],
+              prompt: null,
+              model: null,
+              reasoningEffort: null,
+              agentsStates: {}
+            });
+            send({ method: "item/started", params: { threadId: thread.id, turnId, item: waitItem("inProgress") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: waitItem("completed") } });
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            break;
+          }
+
+          announceChild();
+          send({ method: "turn/started", params: { threadId: childThread.id, turn: buildTurn(childTurnId) } });
+          const childTimer = setTimeout(() => {
+            interruptibleTurns.delete(childTurnId);
+            send({ method: "turn/completed", params: { threadId: childThread.id, turn: buildTurn(childTurnId, "completed") } });
+          }, 8000);
+          interruptibleTurns.set(childTurnId, { threadId: childThread.id, timer: childTimer });
+
+          if (BEHAVIOR === "with-v2-subagent-still-running") {
+            // The root answers and finishes while its subagent is still working.
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+            break;
+          }
+
+          // interruptible-slow-task-with-subagent: root and child both keep running.
+          const rootTimer = setTimeout(() => {
+            interruptibleTurns.delete(turnId);
+            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: finalAnswer } });
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 8000);
+          interruptibleTurns.set(turnId, { threadId: thread.id, timer: rootTimer });
+          break;
+        }
 
         if (
           BEHAVIOR === "with-subagent" ||
           BEHAVIOR === "with-late-subagent-message" ||
-          BEHAVIOR === "with-subagent-no-main-turn-completed"
+          BEHAVIOR === "with-subagent-no-main-turn-completed" ||
+          BEHAVIOR === "child-error"
         ) {
           const subThread = nextThread(state, thread.cwd, true);
           const subThreadRecord = ensureThread(state, subThread.id);
@@ -529,7 +773,21 @@ rl.on("line", (line) => {
               }
             }
           });
-          send({ method: "turn/completed", params: { threadId: subThread.id, turn: buildTurn(subTurnId, "completed") } });
+          if (BEHAVIOR === "child-error") {
+            send({
+              method: "error",
+              params: {
+                threadId: subThread.id,
+                turnId: subTurnId,
+                willRetry: false,
+                error: { message: "subagent could not read the fixtures", codexErrorInfo: null, additionalDetails: null }
+              }
+            });
+          }
+          send({
+            method: "turn/completed",
+            params: { threadId: subThread.id, turn: buildTurn(subTurnId, BEHAVIOR === "child-error" ? "failed" : "completed") }
+          });
           send({
             method: "item/completed",
             params: {
@@ -613,20 +871,32 @@ rl.on("line", (line) => {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
 	        };
+	        state.interrupts = [...(state.interrupts || []), state.lastInterrupt];
 	        saveState(state);
 	        const pending = interruptibleTurns.get(message.params.turnId);
-	        if (pending) {
-	          clearTimeout(pending.timer);
-	          interruptibleTurns.delete(message.params.turnId);
-	          send({
-	            method: "turn/completed",
-	            params: {
-	              threadId: pending.threadId,
-	              turn: buildTurn(message.params.turnId, "interrupted")
-	            }
-	          });
+	        if (!pending) {
+	          const activeTurn = [...interruptibleTurns].find(([, entry]) => entry.threadId === message.params.threadId);
+	          if (activeTurn) {
+	            send({
+	              id: message.id,
+	              error: { code: -32600, message: "expected active turn id " + message.params.turnId + " but found " + activeTurn[0] }
+	            });
+	            break;
+	          }
+	          send({ id: message.id, result: {} });
+	          break;
 	        }
+	        clearTimeout(pending.timer);
+	        interruptibleTurns.delete(message.params.turnId);
+	        // Real Codex answers the interrupt before it reports the aborted turn.
 	        send({ id: message.id, result: {} });
+	        send({
+	          method: "turn/completed",
+	          params: {
+	            threadId: pending.threadId,
+	            turn: buildTurn(pending.completedTurnId || message.params.turnId, "interrupted")
+	          }
+	        });
 	        break;
 	      }
 
@@ -651,8 +921,8 @@ rl.on("line", (line) => {
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
-  return {
+  return stripInheritedEnv({
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
-  };
+  });
 }

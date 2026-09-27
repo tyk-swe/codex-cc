@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -148,13 +149,15 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
+    // The broker we just spawned would otherwise keep running (and later keep
+    // its codex app-server alive) without ever being recorded or used.
     teardownBrokerSession({
       endpoint,
       pidFile,
       logFile,
       sessionDir,
       pid: child.pid ?? null,
-      killProcess: options.killProcess ?? null
+      killProcess: options.killProcess ?? terminateProcessTree
     });
     return null;
   }

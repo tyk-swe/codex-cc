@@ -52,8 +52,9 @@ function stripLogPrefix(line) {
 
 function isProgressBlockTitle(line) {
   return (
-    ["Final output", "Assistant message", "Reasoning summary", "Review output"].includes(line) ||
+    ["Final output", "Assistant message", "Reasoning summary", "Review output", "Codex update", "Codex deprecation notice"].includes(line) ||
     /^Subagent .+ message$/.test(line) ||
+    /^Subagent .+ update$/.test(line) ||
     /^Subagent .+ reasoning summary$/.test(line)
   );
 }

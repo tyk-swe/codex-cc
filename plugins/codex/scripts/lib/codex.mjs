@@ -6,13 +6,19 @@
  * @typedef {import("./app-server-protocol").ThreadStartParams} ThreadStartParams
  * @typedef {import("./app-server-protocol").Turn} Turn
  * @typedef {import("./app-server-protocol").UserInput} UserInput
- * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null }) => void)} ProgressReporter
+ * @typedef {{ threadId: string, turnId: string }} SubagentTurn
+ * @typedef {((update: string | { message: string, phase: string | null, threadId?: string | null, turnId?: string | null, stderrMessage?: string | null, logTitle?: string | null, logBody?: string | null, subagentTurns?: SubagentTurn[] }) => void)} ProgressReporter
  * @typedef {{
  *   threadId: string,
  *   rootThreadId: string,
  *   threadIds: Set<string>,
  *   threadTurnIds: Map<string, string>,
  *   threadLabels: Map<string, string>,
+ *   newlyRegisteredThreads: string[],
+ *   parkedNotifications: Array<{ threadId: string, message: AppServerNotification }>,
+ *   replayingParked: boolean,
+ *   trackDelegateTurn: boolean,
+ *   interruptTurnId: string | null,
  *   turnId: string | null,
  *   bufferedNotifications: AppServerNotification[],
  *   completion: Promise<TurnCaptureState>,
@@ -22,9 +28,10 @@
  *   completed: boolean,
  *   finalAnswerSeen: boolean,
  *   pendingCollaborations: Set<string>,
- *   activeSubagentTurns: Set<string>,
+ *   activeSubagentTurns: Map<string, string>,
  *   completionTimer: ReturnType<typeof setTimeout> | null,
  *   lastAgentMessage: string,
+ *   lastAsyncMessage: string,
  *   reviewText: string,
  *   reasoningSummary: string[],
  *   error: unknown,
@@ -50,13 +57,42 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const QUIET_REQUEST_TIMEOUT_MS = 3000;
 
-function cleanCodexStderr(stderr) {
-  return stderr
+// CSI escape sequences; Codex colours its tracing output even when piped.
+const ANSI_ESCAPE_PATTERN = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+// "…could not update PATH:" (older CLIs) and "…could not create PATH aliases:".
+const PATH_WARNING_PREFIX = "WARNING: proceeding, even though we could not";
+
+export function cleanCodexStderr(stderr) {
+  return String(stderr ?? "")
+    .replace(ANSI_ESCAPE_PATTERN, "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
-    .filter((line) => line && !line.startsWith("WARNING: proceeding, even though we could not update PATH:"))
+    .filter((line) => line && !line.startsWith(PATH_WARNING_PREFIX))
     .join("\n");
+}
+
+/**
+ * Base notification handler for a run: records Codex deprecation notices and
+ * connection-level warnings in the job log. `captureTurn` forwards every
+ * notification it does not consume to this handler.
+ */
+function createNoticeLogger(onProgress) {
+  return (message) => {
+    if (message?.method === "deprecationNotice") {
+      const details = message.params?.details ?? null;
+      emitLogEvent(onProgress, {
+        message: `Codex deprecation notice: ${message.params?.summary ?? ""}`.trim(),
+        logTitle: details ? "Codex deprecation notice" : null,
+        logBody: details
+      });
+      return;
+    }
+    if (message?.method === "warning" && !message.params?.threadId) {
+      emitLogEvent(onProgress, { message: `Codex warning: ${message.params?.message ?? ""}`.trim() });
+    }
+  };
 }
 
 /** @returns {ThreadStartParams} */
@@ -225,7 +261,11 @@ function registerThread(state, threadId, options = {}) {
     return;
   }
 
-  state.threadIds.add(threadId);
+  if (!state.threadIds.has(threadId)) {
+    state.threadIds.add(threadId);
+    // Lets captureTurn replay notifications that arrived before the thread was known.
+    state.newlyRegisteredThreads.push(threadId);
+  }
   const label =
     options.threadName ??
     options.name ??
@@ -236,6 +276,21 @@ function registerThread(state, threadId, options = {}) {
   if (label) {
     state.threadLabels.set(threadId, label);
   }
+}
+
+// Keyed by string so older protocol bindings (without the "completed" kind)
+// still typecheck.
+const SUBAGENT_ACTIVITY_MESSAGES = new Map([
+  ["started", (label) => `Started subagent ${label}.`],
+  ["interacted", (label) => `Messaged subagent ${label}.`],
+  ["interrupted", (label) => `Interrupted subagent ${label}.`],
+  ["completed", (label) => `Subagent ${label} completed.`]
+]);
+
+// "/root/design_challenger" -> "design_challenger"; nested paths keep their parents.
+function formatAgentPath(agentPath) {
+  const value = typeof agentPath === "string" ? agentPath.trim() : "";
+  return value.replace(/^\/root\//, "") || value || null;
 }
 
 function describeStartedItem(state, item) {
@@ -255,6 +310,9 @@ function describeStartedItem(state, item) {
       return { message: `Running tool: ${item.tool}.`, phase: "investigating" };
     case "collabAgentToolCall": {
       const subagents = (item.receiverThreadIds ?? []).map((threadId) => labelForThread(state, threadId) ?? threadId);
+      if (subagents.length === 0 && item.tool === "wait") {
+        return { message: "Waiting for subagents.", phase: "investigating" };
+      }
       const summary =
         subagents.length > 0
           ? `Starting subagent ${subagents.join(", ")} via collaboration tool: ${item.tool}.`
@@ -294,6 +352,12 @@ function describeCompletedItem(state, item) {
     }
     case "exitedReviewMode":
       return { message: "Reviewer finished.", phase: "finalizing" };
+    case "subAgentActivity": {
+      // Only described on completion: Codex emits started/completed back to back.
+      const describe = SUBAGENT_ACTIVITY_MESSAGES.get(String(item.kind));
+      const label = labelForThread(state, item.agentThreadId) ?? formatAgentPath(item.agentPath) ?? item.agentThreadId;
+      return describe ? { message: describe(label), phase: item.kind === "started" ? "investigating" : null } : null;
+    }
     default:
       return null;
   }
@@ -314,6 +378,11 @@ function createTurnCaptureState(threadId, options = {}) {
     threadIds: new Set([threadId]),
     threadTurnIds: new Map(),
     threadLabels: new Map(),
+    newlyRegisteredThreads: [],
+    parkedNotifications: [],
+    replayingParked: false,
+    trackDelegateTurn: Boolean(options.trackDelegateTurn),
+    interruptTurnId: null,
     turnId: null,
     bufferedNotifications: [],
     completion,
@@ -323,9 +392,10 @@ function createTurnCaptureState(threadId, options = {}) {
     completed: false,
     finalAnswerSeen: false,
     pendingCollaborations: new Set(),
-    activeSubagentTurns: new Set(),
+    activeSubagentTurns: new Map(),
     completionTimer: null,
     lastAgentMessage: "",
+    lastAsyncMessage: "",
     reviewText: "",
     reasoningSummary: [],
     error: null,
@@ -355,6 +425,9 @@ function completeTurn(state, turn = null, options = {}) {
     state.finalTurn = turn;
     if (!state.turnId) {
       state.turnId = turn.id;
+    }
+    if (turn.error && !state.error) {
+      state.error = turn.error;
     }
   } else if (!state.finalTurn) {
     state.finalTurn = {
@@ -404,6 +477,13 @@ function belongsToTurn(state, message) {
 }
 
 function recordItem(state, item, lifecycle, threadId = null) {
+  if (item.type === "subAgentActivity") {
+    // Multi-agent v2 (all GPT-6 models) announces subagent threads only
+    // through these items: no thread/started, no collab receiverThreadIds.
+    registerThread(state, item.agentThreadId, { name: formatAgentPath(item.agentPath) });
+    return;
+  }
+
   if (item.type === "collabAgentToolCall") {
     if (!threadId || threadId === state.threadId) {
       if (lifecycle === "started" || item.status === "inProgress") {
@@ -416,6 +496,25 @@ function recordItem(state, item, lifecycle, threadId = null) {
     for (const receiverThreadId of item.receiverThreadIds ?? []) {
       registerThread(state, receiverThreadId);
     }
+  }
+
+  if (item.type === "agentMessage" && item.delivery === "async") {
+    // Mid-turn update from an async tool (send_message_to_user_async,
+    // request_user_input_async). It can carry phase "final_answer" but is not
+    // the turn's answer, so it must not end or become the captured output.
+    if (lifecycle === "completed" && item.text) {
+      if (!threadId || threadId === state.threadId) {
+        state.lastAsyncMessage = item.text;
+      }
+      const sourceLabel = labelForThread(state, threadId);
+      emitLogEvent(state.onProgress, {
+        message: sourceLabel ? `Subagent ${sourceLabel} update: ${shorten(item.text, 96)}` : `Codex update: ${shorten(item.text, 96)}`,
+        stderrMessage: null,
+        logTitle: sourceLabel ? `Subagent ${sourceLabel} update` : "Codex update",
+        logBody: item.text
+      });
+    }
+    return;
   }
 
   if (item.type === "agentMessage") {
@@ -506,19 +605,19 @@ function applyTurnNotification(state, message) {
       registerThread(state, message.params.threadId);
       state.threadTurnIds.set(message.params.threadId, message.params.turn.id);
       if ((message.params.threadId ?? null) !== state.threadId) {
-        state.activeSubagentTurns.add(message.params.threadId);
+        state.activeSubagentTurns.set(message.params.threadId, message.params.turn.id);
+        emitProgress(
+          state.onProgress,
+          `Subagent ${labelForThread(state, message.params.threadId)} turn started (${message.params.turn.id}).`,
+          null,
+          { subagentTurns: snapshotSubagentTurns(state) }
+        );
+        break;
       }
-      emitProgress(
-        state.onProgress,
-        `Turn started (${message.params.turn.id}).`,
-        "starting",
-        (message.params.threadId ?? null) === state.threadId
-          ? {
-              threadId: message.params.threadId ?? null,
-              turnId: message.params.turn.id ?? null
-            }
-          : {}
-      );
+      emitProgress(state.onProgress, `Turn started (${message.params.turn.id}).`, "starting", {
+        threadId: message.params.threadId ?? null,
+        turnId: message.params.turn.id ?? null
+      });
       break;
     case "item/started":
       recordItem(state, message.params.item, "started", message.params.threadId ?? null);
@@ -534,13 +633,43 @@ function applyTurnNotification(state, message) {
         emitProgress(state.onProgress, update?.message, update?.phase ?? null);
       }
       break;
-    case "error":
+    case "error": {
+      const errorMessage = message.params.error?.message ?? "unknown error";
+      if (message.params.willRetry) {
+        // Transient stream retry ("Reconnecting... 2/5"); the turn goes on.
+        emitProgress(state.onProgress, `Codex retrying: ${errorMessage}`);
+        break;
+      }
+      const errorThreadId = message.params.threadId ?? null;
+      if (errorThreadId && errorThreadId !== state.threadId) {
+        // A subagent failing does not fail the task; the root turn decides.
+        emitProgress(state.onProgress, `Subagent ${labelForThread(state, errorThreadId)} error: ${errorMessage}`);
+        break;
+      }
       state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+      emitProgress(state.onProgress, `Codex error: ${errorMessage}`, "failed");
       break;
+    }
+    case "warning": {
+      const sourceLabel = labelForThread(state, message.params.threadId ?? null);
+      emitLogEvent(state.onProgress, {
+        message: sourceLabel
+          ? `Subagent ${sourceLabel} warning: ${message.params.message}`
+          : `Codex warning: ${message.params.message}`
+      });
+      break;
+    }
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
         state.activeSubagentTurns.delete(message.params.threadId);
+        // A subagent can run follow-up turns; accept its next turn id.
+        state.threadTurnIds.delete(message.params.threadId);
+        emitProgress(
+          state.onProgress,
+          `Subagent ${labelForThread(state, message.params.threadId)} turn ${message.params.turn?.status ?? "completed"}.`,
+          null,
+          { subagentTurns: snapshotSubagentTurns(state) }
+        );
         scheduleInferredCompletion(state);
         break;
       }
@@ -556,29 +685,132 @@ function applyTurnNotification(state, message) {
   }
 }
 
+/** @returns {SubagentTurn[]} */
+function snapshotSubagentTurns(state) {
+  return [...state.activeSubagentTurns].map(([threadId, turnId]) => ({ threadId, turnId }));
+}
+
+// Notifications for threads we do not know yet may belong to a subagent whose
+// subAgentActivity item has not arrived: Codex does not order them.
+const PARKABLE_METHODS = new Set(["turn/started", "turn/completed", "item/started", "item/completed", "error", "warning"]);
+const MAX_PARKED_NOTIFICATIONS = 500;
+
+function parkNotification(state, threadId, message) {
+  state.parkedNotifications.push({ threadId, message });
+  if (state.parkedNotifications.length > MAX_PARKED_NOTIFICATIONS) {
+    state.parkedNotifications.shift();
+  }
+}
+
+function replayParkedNotifications(state, dispatch) {
+  if (state.replayingParked) {
+    return;
+  }
+  state.replayingParked = true;
+  try {
+    // Replaying can register further threads (grandchildren); keep going.
+    while (state.newlyRegisteredThreads.length > 0) {
+      const threadId = state.newlyRegisteredThreads.shift();
+      const ready = [];
+      state.parkedNotifications = state.parkedNotifications.filter((entry) => {
+        if (entry.threadId !== threadId) {
+          return true;
+        }
+        ready.push(entry.message);
+        return false;
+      });
+      for (const message of ready) {
+        dispatch(message);
+      }
+    }
+  } finally {
+    state.replayingParked = false;
+  }
+}
+
+// An inline review runs in a delegate turn: turn/started carries the
+// delegate's id, which is the only id turn/interrupt accepts, while items and
+// turn/completed carry the review/start response id.
+function isReviewDelegateTurnStart(state, message) {
+  return (
+    state.trackDelegateTurn &&
+    message.method === "turn/started" &&
+    message.params?.threadId === state.threadId &&
+    Boolean(state.turnId) &&
+    Boolean(message.params?.turn?.id) &&
+    message.params.turn.id !== state.turnId
+  );
+}
+
+/**
+ * GPT-6 subagents can still be running when the root turn completes; nothing
+ * would read their results. Interrupt them so no Codex work keeps changing the
+ * workspace after the run reports completion.
+ */
+async function stopLeftoverSubagents(client, state) {
+  if (state.activeSubagentTurns.size === 0) {
+    return;
+  }
+  const stopped = [];
+  for (const [threadId, turnId] of [...state.activeSubagentTurns]) {
+    const outcome = await requestQuietly(client, "turn/interrupt", { threadId, turnId });
+    if (outcome.ok) {
+      // Codex answers before it sends turn/completed, which may never reach us.
+      state.activeSubagentTurns.delete(threadId);
+      stopped.push(labelForThread(state, threadId) ?? threadId);
+    }
+  }
+  if (stopped.length > 0) {
+    emitProgress(
+      state.onProgress,
+      `Interrupted ${stopped.length} subagent(s) still running when Codex finished: ${stopped.join(", ")}.`,
+      null,
+      { subagentTurns: [] }
+    );
+  }
+}
+
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+
+  const dispatch = (message) => {
+    if (message.method === "thread/started" || message.method === "thread/name/updated") {
+      applyTurnNotification(state, message);
+      replayParkedNotifications(state, dispatch);
+      return;
+    }
+
+    if (isReviewDelegateTurnStart(state, message)) {
+      state.interruptTurnId = message.params.turn.id;
+      emitProgress(state.onProgress, `Turn started (${state.interruptTurnId}).`, "starting", {
+        threadId: state.threadId,
+        turnId: state.interruptTurnId
+      });
+      return;
+    }
+
+    const messageThreadId = extractThreadId(message);
+    if (messageThreadId && !state.threadIds.has(messageThreadId) && PARKABLE_METHODS.has(message.method)) {
+      parkNotification(state, messageThreadId, message);
+      return;
+    }
+
+    if (!belongsToTurn(state, message)) {
+      previousHandler?.(message);
+      return;
+    }
+
+    applyTurnNotification(state, message);
+    replayParkedNotifications(state, dispatch);
+  };
 
   client.setNotificationHandler((message) => {
     if (!state.turnId) {
       state.bufferedNotifications.push(message);
       return;
     }
-
-    if (message.method === "thread/started" || message.method === "thread/name/updated") {
-      applyTurnNotification(state, message);
-      return;
-    }
-
-    if (!belongsToTurn(state, message)) {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-        return;
-    }
-
-    applyTurnNotification(state, message);
+    dispatch(message);
   });
 
   try {
@@ -588,26 +820,43 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
-    for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
-        applyTurnNotification(state, message);
-      } else {
-        if (previousHandler) {
-          previousHandler(message);
-        }
-      }
+    for (const message of state.bufferedNotifications.splice(0)) {
+      dispatch(message);
     }
-    state.bufferedNotifications.length = 0;
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
     }
 
-    return await state.completion;
+    await waitForTurnOrExit(client, state);
+    await stopLeftoverSubagents(client, state);
+    // The connection is subscribed to every subagent thread; release them so
+    // they unload instead of accumulating in the shared broker. The caller
+    // releases the root thread.
+    for (const subagentThreadId of state.threadIds) {
+      if (subagentThreadId !== state.threadId) {
+        await releaseThread(client, subagentThreadId);
+      }
+    }
+    return state;
   } finally {
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+// A turn only ends with turn/completed; if the connection to Codex goes away
+// first, fail instead of waiting forever.
+function waitForTurnOrExit(client, state) {
+  const exited = client.exitPromise.then(() => {
+    if (state.completed) {
+      return state;
+    }
+    const stderr = cleanCodexStderr(client.stderr);
+    throw client.exitError ?? new Error(`codex app-server exited before the turn completed.${stderr ? `\n${stderr}` : ""}`);
+  });
+  exited.catch(() => {});
+  return Promise.race([state.completion, exited]);
 }
 
 async function withAppServer(cwd, fn) {
@@ -698,11 +947,22 @@ function externalAgentSessionMigration(sourcePath, cwd) {
   };
 }
 
+// Completions from older CLIs carry no importId (or no params at all).
+function isCompletionForImport(completion, importId) {
+  return !completion?.importId || !importId || completion.importId === importId;
+}
+
+/** Resolves with the matching `externalAgentConfig/import/completed` params. */
 async function requestExternalAgentSessionImport(client, params) {
   const previousHandler = client.notificationHandler;
   let timeout = null;
-  let resolveCompleted;
-  let rejectCompleted;
+  let importId = null;
+  let responded = false;
+  const earlyCompletions = [];
+  /** @type {(completion: any) => void} */
+  let resolveCompleted = () => {};
+  /** @type {(error: Error) => void} */
+  let rejectCompleted = () => {};
   const completed = new Promise((resolve, reject) => {
     resolveCompleted = resolve;
     rejectCompleted = reject;
@@ -711,7 +971,13 @@ async function requestExternalAgentSessionImport(client, params) {
 
   client.setNotificationHandler((message) => {
     if (message.method === EXTERNAL_AGENT_IMPORT_COMPLETED) {
-      resolveCompleted();
+      const completion = message.params ?? {};
+      if (!responded) {
+        // Can arrive before the response that tells us our importId.
+        earlyCompletions.push(completion);
+      } else if (isCompletionForImport(completion, importId)) {
+        resolveCompleted(completion);
+      }
       return;
     }
     previousHandler?.(message);
@@ -721,12 +987,46 @@ async function requestExternalAgentSessionImport(client, params) {
   }, EXTERNAL_AGENT_IMPORT_TIMEOUT_MS);
 
   try {
-    await client.request("externalAgentConfig/import", params);
-    await completed;
+    const response = await client.request("externalAgentConfig/import", params);
+    importId = response?.importId ?? null;
+    responded = true;
+    const earlyMatch = earlyCompletions.find((completion) => isCompletionForImport(completion, importId));
+    if (earlyMatch) {
+      resolveCompleted(earlyMatch);
+    }
+    return await completed;
   } finally {
     clearTimeout(timeout);
     client.setNotificationHandler(previousHandler ?? null);
   }
+}
+
+function realpathOrSelf(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return filePath;
+  }
+}
+
+/**
+ * Picks the imported thread (success `target`) or the failure for this Claude
+ * session out of an `import/completed` payload.
+ */
+function readImportedSessionResult(completion, sourcePath) {
+  const results = Array.isArray(completion?.itemTypeResults) ? completion.itemTypeResults : [];
+  const sessionResults = results.filter((result) => result?.itemType === "SESSIONS");
+  const relevant = sessionResults.length > 0 ? sessionResults : results;
+  const successes = relevant.flatMap((result) => (Array.isArray(result?.successes) ? result.successes : []));
+  const failures = relevant.flatMap((result) => (Array.isArray(result?.failures) ? result.failures : []));
+  const canonicalSource = realpathOrSelf(sourcePath);
+  const isThisSession = (entry) =>
+    typeof entry?.source === "string" &&
+    (entry.source === sourcePath || entry.source === canonicalSource || realpathOrSelf(entry.source) === canonicalSource);
+  const hasTarget = (entry) => typeof entry?.target === "string" && entry.target.length > 0;
+  const success = successes.find((entry) => hasTarget(entry) && isThisSession(entry)) ?? successes.find(hasTarget) ?? null;
+  const failure = failures.find(isThisSession) ?? failures[0] ?? null;
+  return { threadId: success?.target ?? null, failure };
 }
 
 async function startThread(client, cwd, options = {}) {
@@ -747,8 +1047,62 @@ async function startThread(client, cwd, options = {}) {
   return response;
 }
 
+function isUnsupportedExcludeTurnsError(error) {
+  return /excludeTurns/.test(String(error?.message ?? ""));
+}
+
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  const params = buildResumeParams(threadId, cwd, options);
+  try {
+    // The plugin never reads thread.turns, and full-history hydration is
+    // deprecated for paginated threads.
+    return await client.request("thread/resume", { ...params, excludeTurns: true });
+  } catch (error) {
+    // Older Codex CLIs (e.g. 0.142) gate excludeTurns behind experimentalApi.
+    if (!isUnsupportedExcludeTurnsError(error)) {
+      throw error;
+    }
+    return client.request("thread/resume", params);
+  }
+}
+
+/**
+ * Best-effort request that never throws and never waits longer than
+ * `timeoutMs`. Used after a turn has finished, where a failure must not make
+ * `withAppServer` retry (and re-run) the whole task, and where `turn/interrupt`
+ * only answers once the turn has actually aborted.
+ */
+async function requestQuietly(client, method, params, timeoutMs = QUIET_REQUEST_TIMEOUT_MS) {
+  let timer = null;
+  const request = Promise.resolve()
+    .then(() => client.request(method, params))
+    .then(
+      (result) => ({ ok: true, result, error: null }),
+      (error) => ({ ok: false, result: null, error })
+    );
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(
+      () => resolve({ ok: false, result: null, error: new Error(`${method} timed out after ${timeoutMs}ms.`) }),
+      timeoutMs
+    );
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([request, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Release this connection's subscription so the thread can unload. While a
+ * thread stays loaded (always the case behind the shared broker), a later
+ * `thread/resume` silently ignores its sandbox and model overrides.
+ */
+async function releaseThread(client, threadId) {
+  if (threadId) {
+    await requestQuietly(client, "thread/unsubscribe", { threadId });
+  }
 }
 
 function buildResultStatus(turnState) {
@@ -883,6 +1237,33 @@ async function getCodexAuthStatusFromClient(client, cwd) {
   }
 }
 
+// Oldest Codex CLI this plugin is tested against (GPT-6 models, excludeTurns).
+// Older CLIs keep working through fallbacks; /codex:setup suggests updating.
+export const TESTED_CODEX_VERSION = "0.157.0";
+
+/** Parses "codex-cli 0.157.1" (as printed by `codex --version`). */
+export function parseCodexVersion(text) {
+  const match = /\bcodex-cli\s+v?(\d+)\.(\d+)\.(\d+)/.exec(String(text ?? ""));
+  if (!match) {
+    return null;
+  }
+  const [major, minor, patch] = match.slice(1, 4).map(Number);
+  return { major, minor, patch, raw: `${major}.${minor}.${patch}` };
+}
+
+export function isCodexVersionBelow(version, minimum = TESTED_CODEX_VERSION) {
+  const floor = parseCodexVersion(`codex-cli ${minimum}`);
+  if (!version || !floor) {
+    return false;
+  }
+  for (const key of ["major", "minor", "patch"]) {
+    if (version[key] !== floor[key]) {
+      return version[key] < floor[key];
+    }
+  }
+  return false;
+}
+
 export function getCodexAvailability(cwd) {
   const versionStatus = binaryAvailable("codex", ["--version"], { cwd });
   if (!versionStatus.available) {
@@ -957,6 +1338,67 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
+const INTERRUPT_TIMEOUT_MS = 5000;
+
+/**
+ * Interrupts several turns over one connection, in order. `turn/interrupt`
+ * only answers once the turn has aborted, so every call is bounded.
+ */
+export async function interruptAppServerTurns(cwd, targets) {
+  const turns = (Array.isArray(targets) ? targets : []).filter((target) => target?.threadId && target?.turnId);
+  if (turns.length === 0) {
+    return [];
+  }
+
+  const availability = getCodexAvailability(cwd);
+  if (!availability.available) {
+    return turns.map(({ threadId, turnId }) => ({
+      threadId,
+      turnId,
+      attempted: false,
+      interrupted: false,
+      transport: null,
+      detail: availability.detail
+    }));
+  }
+
+  let client = null;
+  try {
+    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
+  } catch (error) {
+    return turns.map(({ threadId, turnId }) => ({
+      threadId,
+      turnId,
+      attempted: true,
+      interrupted: false,
+      transport: null,
+      detail: error instanceof Error ? error.message : String(error)
+    }));
+  }
+
+  const results = [];
+  try {
+    for (const { threadId, turnId } of turns) {
+      const outcome = await requestQuietly(client, "turn/interrupt", { threadId, turnId }, INTERRUPT_TIMEOUT_MS);
+      results.push({
+        threadId,
+        turnId,
+        attempted: true,
+        interrupted: outcome.ok,
+        transport: client.transport,
+        detail: outcome.ok
+          ? `Interrupted ${turnId} on ${threadId}.`
+          : outcome.error instanceof Error
+            ? outcome.error.message
+            : String(outcome.error)
+      });
+    }
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return results;
+}
+
 export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   if (!threadId || !turnId) {
     return {
@@ -966,37 +1408,49 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
       detail: "missing threadId or turnId"
     };
   }
+  const [result] = await interruptAppServerTurns(cwd, [{ threadId, turnId }]);
+  return {
+    attempted: result.attempted,
+    interrupted: result.interrupted,
+    transport: result.transport,
+    detail: result.detail
+  };
+}
 
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
+/**
+ * Releases the shared broker's hold on the threads of a run that was killed
+ * before it could release them itself (see releaseThread). Without a broker
+ * the killed run's own app-server exited with it, so nothing is left to do.
+ */
+export async function releaseBrokerThreads(cwd, threadIds) {
+  const ids = [...new Set((threadIds ?? []).filter(Boolean))];
+  const brokerEndpoint = process.env[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
+  if (ids.length === 0 || !brokerEndpoint) {
+    return [];
   }
 
   let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
-  } catch (error) {
-    return {
-      attempted: true,
-      interrupted: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await client?.close().catch(() => {});
+    client = await CodexAppServerClient.connect(cwd, { brokerEndpoint });
+  } catch {
+    return [];
   }
+
+  const results = [];
+  try {
+    for (const threadId of ids) {
+      let outcome = await requestQuietly(client, "thread/unsubscribe", { threadId });
+      if (outcome.error?.rpcCode === BROKER_BUSY_RPC_CODE) {
+        // The broker may not have seen the killed run's connection close yet.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        outcome = await requestQuietly(client, "thread/unsubscribe", { threadId });
+      }
+      results.push({ threadId, released: outcome.ok });
+    }
+  } finally {
+    await client.close().catch(() => {});
+  }
+  return results;
 }
 
 export async function runAppServerReview(cwd, options = {}) {
@@ -1006,6 +1460,7 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
@@ -1017,29 +1472,32 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
       threadId: sourceThreadId
     });
-    const delivery = options.delivery ?? "inline";
 
-    const turnState = await captureTurn(
-      client,
-      sourceThreadId,
-      () =>
-        client.request("review/start", {
-          threadId: sourceThreadId,
-          delivery,
-          target: options.target
-        }),
-      {
-        onProgress: options.onProgress,
-        onResponse(response, state) {
-          if (response.reviewThreadId) {
-            state.threadIds.add(response.reviewThreadId);
-            if (delivery === "detached") {
-              state.threadId = response.reviewThreadId;
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        sourceThreadId,
+        () =>
+          client.request("review/start", {
+            threadId: sourceThreadId,
+            // Detached delivery is deprecated; inline reviews run on this thread.
+            delivery: "inline",
+            target: options.target
+          }),
+        {
+          onProgress: options.onProgress,
+          trackDelegateTurn: true,
+          onResponse(response, state) {
+            if (response.reviewThreadId) {
+              state.threadIds.add(response.reviewThreadId);
             }
           }
         }
-      }
-    );
+      );
+    } finally {
+      await releaseThread(client, sourceThreadId);
+    }
 
     return {
       status: buildResultStatus(turnState),
@@ -1065,9 +1523,11 @@ export async function importExternalAgentSession(cwd, options = {}) {
   }
 
   return withDirectAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
+    let completion;
     try {
-      await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
+      completion = await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
     } catch (error) {
       if (error?.rpcCode === -32601) {
         throw new Error(
@@ -1077,7 +1537,13 @@ export async function importExternalAgentSession(cwd, options = {}) {
       }
       throw error;
     }
-    const threadId = importedThreadIdForSource(options.sourcePath);
+    const imported = readImportedSessionResult(completion, options.sourcePath);
+    if (!imported.threadId && imported.failure) {
+      const stage = imported.failure.failureStage ? ` (${imported.failure.failureStage})` : "";
+      throw new Error(`Codex could not import the Claude session${stage}: ${imported.failure.message ?? "unknown error"}`);
+    }
+    // Older CLIs complete without results; their import ledger records the thread.
+    const threadId = imported.threadId ?? importedThreadIdForSource(options.sourcePath);
     if (!threadId) {
       const stderr = cleanCodexStderr(client.stderr);
       throw new Error(
@@ -1099,6 +1565,7 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    client.setNotificationHandler(createNoticeLogger(options.onProgress));
     let threadId;
 
     if (options.resumeThreadId) {
@@ -1126,28 +1593,35 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     const prompt = options.prompt?.trim() || options.defaultPrompt || "";
     if (!prompt) {
+      await releaseThread(client, threadId);
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
-      client,
-      threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
-      { onProgress: options.onProgress }
-    );
+    let turnState;
+    try {
+      turnState = await captureTurn(
+        client,
+        threadId,
+        () =>
+          client.request("turn/start", {
+            threadId,
+            input: buildTurnInput(prompt),
+            model: options.model ?? null,
+            effort: options.effort ?? null,
+            outputSchema: options.outputSchema ?? null
+          }),
+        { onProgress: options.onProgress }
+      );
+    } finally {
+      await releaseThread(client, threadId);
+    }
 
     return {
       status: buildResultStatus(turnState),
       threadId,
       turnId: turnState.turnId,
-      finalMessage: turnState.lastAgentMessage,
+      // A turn that ends without a regular answer still reports its last update.
+      finalMessage: turnState.lastAgentMessage || turnState.lastAsyncMessage,
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
@@ -1170,7 +1644,11 @@ export async function findLatestTaskThread(cwd) {
       cwd,
       limit: 20,
       sortKey: "updated_at",
-      sourceKinds: ["appServer"],
+      // `codex app-server` records the threads it creates with the "vscode"
+      // source; "appServer" is kept in case that ever changes.
+      sourceKinds: ["vscode", "appServer"],
+      // Without this, only threads from the current default provider are listed.
+      modelProviders: [],
       searchTerm: TASK_THREAD_PREFIX
     });
 

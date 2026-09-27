@@ -22,6 +22,12 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+// Unload a thread as soon as it is idle and no connection is subscribed, so a
+// finished run releases the thread's writer lock right away. With Codex's
+// 60-second default, `codex resume <thread>` elsewhere fails meanwhile with
+// "already has an active writer" while the shared broker keeps running.
+const APP_SERVER_ARGS = ["app-server", "-c", "thread_unload_delay_secs=0"];
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -33,11 +39,17 @@ const DEFAULT_CLIENT_INFO = {
 const DEFAULT_CAPABILITIES = {
   experimentalApi: false,
   requestAttestation: false,
+  // Streaming updates the plugin never reads; completed items carry the
+  // final content. Unknown method names are ignored by older app-servers.
   optOutNotificationMethods: [
     "item/agentMessage/delta",
     "item/reasoning/summaryTextDelta",
     "item/reasoning/summaryPartAdded",
-    "item/reasoning/textDelta"
+    "item/reasoning/textDelta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+    "item/plan/delta",
+    "turn/diff/updated"
   ]
 };
 
@@ -86,6 +98,11 @@ class AppServerClientBase {
   request(method, params) {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
+    }
+    if (this.exitResolved) {
+      // handleExit already rejected everything pending; a new request would
+      // otherwise wait forever.
+      return Promise.reject(this.exitError ?? new Error("codex app-server connection closed."));
     }
 
     const id = this.nextId;
@@ -187,7 +204,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    this.proc = spawn("codex", APP_SERVER_ARGS, {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -197,6 +214,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
+    // Writing to a dead app-server raises EPIPE; the exit handler reports it.
+    this.proc.stdin.on("error", () => {});
 
     this.proc.stderr.on("data", (chunk) => {
       this.stderr += chunk;

@@ -1,12 +1,25 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { listJobs, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+const MAX_TRACKED_SUBAGENT_TURNS = 32;
+
+// Active subagent turns reported by the runtime, so /codex:cancel can reach them.
+function normalizeSubagentTurns(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value
+    .filter((entry) => typeof entry?.threadId === "string" && entry.threadId && typeof entry?.turnId === "string" && entry.turnId)
+    .slice(0, MAX_TRACKED_SUBAGENT_TURNS)
+    .map((entry) => ({ threadId: entry.threadId, turnId: entry.turnId }));
 }
 
 function normalizeProgressEvent(value) {
@@ -18,7 +31,8 @@ function normalizeProgressEvent(value) {
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      subagentTurns: normalizeSubagentTurns(value.subagentTurns)
     };
   }
 
@@ -29,7 +43,8 @@ function normalizeProgressEvent(value) {
     turnId: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
-    logBody: null
+    logBody: null,
+    subagentTurns: null
   };
 }
 
@@ -71,11 +86,22 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastSubagentTurnsKey = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = { id: jobId };
     let changed = false;
+    // Only the job file needs this; keep state.json small.
+    let jobFilePatch = null;
+
+    if (normalized.subagentTurns) {
+      const key = JSON.stringify(normalized.subagentTurns);
+      if (key !== lastSubagentTurnsKey) {
+        lastSubagentTurnsKey = key;
+        jobFilePatch = { subagentTurns: normalized.subagentTurns };
+      }
+    }
 
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;
@@ -95,11 +121,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
-    if (!changed) {
+    if (!changed && !jobFilePatch) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    if (changed) {
+      upsertJob(workspaceRoot, patch);
+    }
 
     const jobFile = resolveJobFile(workspaceRoot, jobId);
     if (!fs.existsSync(jobFile)) {
@@ -109,7 +137,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     const storedJob = readJobFile(jobFile);
     writeJobFile(workspaceRoot, jobId, {
       ...storedJob,
-      ...patch
+      ...patch,
+      ...(jobFilePatch ?? {})
     });
   };
 }
@@ -139,6 +168,16 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// /codex:cancel records the cancellation in both the job file and the job
+// index. This run's own progress updates can race with that and restore
+// "running" in one of them, so either one saying "cancelled" is enough.
+function isJobCancelled(workspaceRoot, jobId) {
+  return (
+    readStoredJobOrNull(workspaceRoot, jobId)?.status === "cancelled" ||
+    listJobs(workspaceRoot).some((entry) => entry.id === jobId && entry.status === "cancelled")
+  );
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -153,6 +192,11 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
+    if (isJobCancelled(job.workspaceRoot, job.id)) {
+      // /codex:cancel already finalized this job; the interrupted run ending
+      // afterwards must not relabel it as failed.
+      return execution;
+    }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
@@ -180,6 +224,9 @@ export async function runTrackedJob(job, runner, options = {}) {
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    if (isJobCancelled(job.workspaceRoot, job.id)) {
+      throw error;
+    }
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {

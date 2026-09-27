@@ -15,16 +15,20 @@ import {
     getCodexAvailability,
     getSessionRuntimeStatus,
     importExternalAgentSession,
-    interruptAppServerTurn,
+    isCodexVersionBelow,
+    parseCodexVersion,
+    TESTED_CODEX_VERSION,
+    interruptAppServerTurns,
     parseStructuredOutput,
     readOutputSchema,
+    releaseBrokerThreads,
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, isProcessRunning, terminateProcessTree, waitForProcessExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -68,8 +72,9 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// Codex forwards any effort string; which ones a model accepts depends on the
+// model (GPT-6: low…max, plus ultra on Astra and Sol). This catches typos.
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -79,7 +84,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      `  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <${[...VALID_REASONING_EFFORTS].join("|")}>] [prompt]`,
+      `  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <${[...VALID_REASONING_EFFORTS].join("|")}>] [prompt]`,
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -105,10 +110,8 @@ function normalizeRequestedModel(model) {
     return null;
   }
   const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  // Model ids are passed to Codex verbatim (e.g. gpt-6-sol, gpt-6-luna).
+  return normalized || null;
 }
 
 function normalizeReasoningEffort(effort) {
@@ -190,6 +193,12 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const nextSteps = [];
   if (!codexStatus.available) {
     nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+  }
+  const codexVersion = codexStatus.available ? parseCodexVersion(codexStatus.detail) : null;
+  if (isCodexVersionBelow(codexVersion)) {
+    nextSteps.push(
+      `Update Codex with \`npm install -g @openai/codex@latest\` (or \`codex update\`); this plugin is tested with Codex CLI ${TESTED_CODEX_VERSION} or later and you have ${codexVersion.raw}.`
+    );
   }
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
@@ -960,6 +969,21 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+// How long /codex:cancel lets an interrupted run finish on its own, and how
+// long it then waits for a killed one to go away.
+const CANCEL_EXIT_GRACE_MS = 10000;
+const CANCEL_KILL_WAIT_MS = 2000;
+
+function recordCancellation(workspaceRoot, job, cancellation) {
+  writeJobFile(workspaceRoot, job.id, {
+    ...job,
+    ...(readStoredJob(workspaceRoot, job.id) ?? {}),
+    ...cancellation,
+    cancelledAt: cancellation.completedAt
+  });
+  upsertJob(workspaceRoot, { id: job.id, ...cancellation });
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -972,8 +996,38 @@ async function handleCancel(argv) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
+  const subagentTurns = Array.isArray(existing.subagentTurns) ? existing.subagentTurns : [];
+  const pid = job.pid ?? Number.NaN;
+  const runWasAlive = isProcessRunning(pid);
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  // Mark the job cancelled first so the interrupted run, when it ends, does
+  // not record itself as failed.
+  const cancellation = {
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt: nowIso(),
+    errorMessage: "Cancelled by user."
+  };
+  recordCancellation(workspaceRoot, job, cancellation);
+
+  // GPT-6 subagents keep running when only the root turn is interrupted, so
+  // stop them first, then the root turn, over one connection.
+  const hasRootTurn = Boolean(threadId && turnId);
+  const interrupts = await interruptAppServerTurns(cwd, [...subagentTurns, ...(hasRootTurn ? [{ threadId, turnId }] : [])]);
+  const interrupt = hasRootTurn
+    ? interrupts.at(-1)
+    : { attempted: false, interrupted: false, detail: "missing threadId or turnId" };
+  const subagentInterrupts = hasRootTurn ? interrupts.slice(0, -1) : interrupts;
+
+  for (const result of subagentInterrupts) {
+    appendLogLine(
+      job.logFile,
+      result.interrupted
+        ? `Requested subagent turn interrupt for ${result.turnId} on ${result.threadId}.`
+        : `Subagent turn interrupt failed${result.detail ? `: ${result.detail}` : "."}`
+    );
+  }
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -983,39 +1037,36 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  // An interrupted run winds down within moments and releases its Codex
+  // threads on the way out. Kill it only if it does not. A run that was killed
+  // (or had already died) leaves its threads loaded in the shared broker, where
+  // the next resume ignores --write or --model and `codex resume` fails with
+  // "already has an active writer", so release them here instead.
+  const exitedOnItsOwn = runWasAlive && interrupt.interrupted && (await waitForProcessExit(pid, CANCEL_EXIT_GRACE_MS));
+  if (!exitedOnItsOwn) {
+    if (runWasAlive) {
+      terminateProcessTree(pid, { expectedCommand: /codex-companion\.mjs/ });
+      await waitForProcessExit(pid, CANCEL_KILL_WAIT_MS);
+    }
+    await releaseBrokerThreads(cwd, [threadId, ...subagentTurns.map((entry) => entry.threadId)]);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
+  // The run may have rewritten the job while it wound down. It is gone now, so
+  // record the cancellation again, last.
+  recordCancellation(workspaceRoot, job, cancellation);
 
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
-
+  const nextJob = { ...job, ...cancellation };
   const payload = {
     jobId: job.id,
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    subagentInterrupts: subagentInterrupts.map(({ threadId: subagentThreadId, turnId: subagentTurnId, interrupted }) => ({
+      threadId: subagentThreadId,
+      turnId: subagentTurnId,
+      interrupted
+    }))
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);

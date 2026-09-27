@@ -303,7 +303,8 @@ export function renderNativeReviewResult(result, meta) {
     lines.push("Codex review failed.");
   }
 
-  if (stderr) {
+  // Codex logs routine diagnostics to stderr; only show them when they explain a failure.
+  if (stderr && result.status !== 0) {
     lines.push("", "stderr:", "", "```text", stderr, "```");
   }
 
